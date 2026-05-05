@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pt
+norm_stats.json
+logs/
+checkpoints/
+notebooks/
+results/**/*.svg
+results/provenance.log
+.DS_Store
