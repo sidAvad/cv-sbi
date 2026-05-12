@@ -5,7 +5,7 @@ __pycache__/
 norm_stats.json
 logs/
 checkpoints/
+outputs/
+dry-runs/
 notebooks/
-results/**/*.svg
-results/provenance.log
 .DS_Store

@@ -1,5 +1,9 @@
 """
-PyTorch Dataset for the cardiovascular ODE surrogate.
+PyTorch Dataset for SBI over cardiovascular physiology.
+
+Returns raw (unnormalized) parameters as theta, and all 28 waveforms
+(24 continuous z-scored + 4 binary valves) stacked as a flat observation
+vector for sbi's append_simulations.
 """
 
 import json
@@ -28,6 +32,10 @@ WAVE_KEYS_CONT = [
 
 WAVE_KEYS_VALVE = ["av", "mv", "pv", "tv"]
 
+N_PARAMS = len(PARAM_KEYS)       # 25
+N_CHANNELS = len(WAVE_KEYS_CONT) + len(WAVE_KEYS_VALVE)  # 28
+T = 201
+
 
 class CVDataset(Dataset):
     def __init__(self, data_dir, index_entries, stats):
@@ -35,14 +43,13 @@ class CVDataset(Dataset):
         self.index = index_entries
         self._handles = {}
 
-        p = stats["parameters"]
-        self.param_mean = torch.tensor([p[k]["mean"] for k in PARAM_KEYS], dtype=torch.float32)
-        self.param_std  = torch.tensor([p[k]["std"]  for k in PARAM_KEYS], dtype=torch.float32)
-
         w = stats["waves"]
-        # unsqueeze(1) gives shape (24, 1) so it broadcasts over (24, 201)
-        self.wave_mean = torch.tensor([w[k]["mean"] for k in WAVE_KEYS_CONT], dtype=torch.float32).unsqueeze(1)
-        self.wave_std  = torch.tensor([w[k]["std"]  for k in WAVE_KEYS_CONT], dtype=torch.float32).unsqueeze(1)
+        self.wave_mean = torch.tensor(
+            [w[k]["mean"] for k in WAVE_KEYS_CONT], dtype=torch.float32
+        ).unsqueeze(1)  # (24, 1) — broadcasts over (24, 201)
+        self.wave_std = torch.tensor(
+            [w[k]["std"] for k in WAVE_KEYS_CONT], dtype=torch.float32
+        ).unsqueeze(1)
 
     def __len__(self):
         return len(self.index)
@@ -54,22 +61,27 @@ class CVDataset(Dataset):
             self._handles[path] = h5py.File(path, "r")
         g = self._handles[path][entry["group"]]
 
-        params = torch.tensor(
+        # theta: raw parameter values, shape (25,)
+        theta = torch.tensor(
             [float(g[f"parameters/{k}"][()]) for k in PARAM_KEYS],
             dtype=torch.float32,
         )
-        params = (params - self.param_mean) / (self.param_std + 1e-8)
 
+        # continuous waveforms: z-scored, shape (24, 201)
         waves_cont = torch.from_numpy(
             np.stack([g[f"waves/{k}"][:] for k in WAVE_KEYS_CONT]).astype(np.float32)
         )
         waves_cont = (waves_cont - self.wave_mean) / (self.wave_std + 1e-8)
 
+        # valve waveforms: binary float as-is, shape (4, 201)
         waves_valve = torch.from_numpy(
             np.stack([g[f"waves/{k}"][:] for k in WAVE_KEYS_VALVE]).astype(np.float32)
         )
 
-        return params, waves_cont, waves_valve
+        # x: all 28 channels stacked flat → (28*201,) for sbi
+        x = torch.cat([waves_cont, waves_valve], dim=0).reshape(-1)
+
+        return theta, x
 
     def close(self):
         for fh in self._handles.values():
@@ -84,7 +96,6 @@ def load_stats(stats_path="norm_stats.json"):
         return json.load(f)
 
 
-def load_manifest(data_dir):
-    path = os.path.join(data_dir, "manifest_train.json")
-    with open(path) as f:
+def load_manifest(manifest_path):
+    with open(manifest_path) as f:
         return json.load(f)
