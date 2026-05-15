@@ -1,0 +1,56 @@
+{
+  "run": "exp_baseline_cnn4e64_maf5",
+  "type": "exp",
+  "timestamp": "2026-05-12T20:39:16",
+  "script": "/home/sa4604/cv-sbi/train_sbi.py",
+  "git_hash": "2ca179d",
+  "device": "cuda",
+  "data": {
+    "n_sims": 100000,
+    "data_dir": "/media/8TBNVME/data/neh10/hdf5/cv8/simset_10M_cv8Eed_20260314/train",
+    "manifest": "/media/8TBNVME/data/neh10/hdf5/cv8/simset_10M_cv8Eed_20260314/manifest_train.json"
+  },
+  "embedding": {
+    "type": "WaveformEmbedding",
+    "input": "(28, 201)",
+    "conv_layers": [
+      {
+        "in": 28,
+        "out": 64,
+        "kernel": 7,
+        "stride": 1
+      },
+      {
+        "in": 64,
+        "out": 128,
+        "kernel": 5,
+        "stride": 2
+      },
+      {
+        "in": 128,
+        "out": 256,
+        "kernel": 5,
+        "stride": 2
+      },
+      {
+        "in": 256,
+        "out": 256,
+        "kernel": 3,
+        "stride": 1
+      }
+    ],
+    "pooling": "global_avg",
+    "embed_dim": 64,
+    "n_params": 431104
+  },
+  "flow": {
+    "model": "maf",
+    "hidden_features": 128,
+    "num_transforms": 5,
+    "z_score_theta": "independent",
+    "z_score_x": "none"
+  },
+  "training": {
+    "batch_size": 512
+  }
+}

@@ -4,49 +4,50 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-Simulation-based inference (SBI) over cardiovascular physiology. Given observed waveforms, infer a posterior distribution over the 25 physiological parameters using the [`sbi`](https://sbi-dev.github.io/sbi/) package with the CVSurrogate MLP as the simulator.
+Simulation-based inference (SBI) over cardiovascular physiology. Given observed waveforms, infer a posterior distribution over the 25 physiological parameters using the [`sbi`](https://sbi-dev.github.io/sbi/) package with pre-simulated (theta, waveform) pairs.
 
 Forked from `cv-inverse-autoencoder` (the surrogate training repo).
 
 ## Approach
 
-- **Simulator**: `CVSurrogate` from `model.py` — takes 25 parameters → 28 waveforms (24 continuous + 4 valve), each 201 time steps. A trained checkpoint acts as a fast differentiable simulator in place of the full ODE solver.
-- **Inference**: Sequential Neural Posterior Estimation (SNPE/SNLE/SNRE) via the `sbi` package.
-- **PINN loss**: physics-informed regularisation term to constrain parameter estimates toward cardiovascular-consistent solutions.
+- **No live simulator**: uses pre-simulated HDF5 data directly via `sbi`'s `append_simulations`
+- **Inference**: Neural Posterior Estimation (NPE) via the `sbi` package (v0.26)
+- **Observation**: 28 waveforms × 201 time steps per simulation
 
 ## Data layout
 
-- HDF5 files are at `DATA_DIR = /media/8TBNVME/data/neh10/hdf5/cv8/simset_10M_cv8Eed_20260314/train/`
-- `manifest_train.json` lives one level above `DATA_DIR`; its `"index"` list has entries `{"id", "file", "group"}` pointing into numbered HDF5 files
+- HDF5 files at `/media/8TBNVME/data/neh10/hdf5/cv8/simset_10M_cv8Eed_20260314/train/` and `test/`
+- `manifest_train.json` / `manifest_test.json` live one level above the data dirs
 - Each HDF5 group (`sim_NNNNNN`) holds `parameters/<key>` scalars and `waves/<key>` arrays of length 201
-- `norm_stats.json`: normalisation stats computed by `compute_stats.py` (not committed)
-
-## Surrogate architecture (`model.py`)
-
-**`CVSurrogate`**:
-- Trunk: 6 × Linear(1024) + SiLU
-- Continuous head: Linear → reshape `(B, 24, 201)` — MSE loss
-- Valve head: Linear → reshape `(B, 4, 201)` raw logits — BCEWithLogitsLoss
+- `norm_stats.json`: wave normalisation stats (not committed)
+- 25 variable parameters defined by `pvar_low`/`pvar_high` in manifest config
 
 ## Key constants
 
 | Symbol | Value | Meaning |
 |---|---|---|
-| `N_PARAMS` | 25 | Input dimension |
-| `N_WAVES_CONT` | 24 | Continuous output channels |
-| `N_WAVES_VALVE` | 4 | Binary valve channels (av, mv, pv, tv) |
+| `N_PARAMS` | 25 | Parameters to infer |
+| `N_CHANNELS` | 28 | Total waveform channels (24 continuous + 4 valve) |
 | `T` | 201 | Time steps per waveform |
-| `HIDDEN` | 1024 | MLP hidden size |
-| `N_LAYERS` | 6 | MLP depth |
 
-## Workflow (planned)
+## Run naming convention
 
-1. `compute_stats.py` — compute normalisation stats (once per dataset)
-2. Load a pretrained `CVSurrogate` checkpoint from `cv-inverse-autoencoder`
-3. Define prior over 25 parameters
-4. Run SNPE rounds using the surrogate as simulator
-5. Evaluate posterior quality
+`{type}_{series}_{embedding}_{flow}[_{extras}]`
+
+- type: `exp_` (full run) or `dry-run_` (512 sims, smoke test, no posterior saved)
+- embedding: `cnn4e64` (4-block CNN, 64-dim), `sumstats` (hand-crafted summary stats), etc.
+- flow: `maf5` (MAF, 5 transforms), `nsf8`, etc.
+
+Examples: `exp_baseline_cnn4e64_maf5`, `exp_v2_sumstats_maf5`, `dry-run_sumstats`
+
+## Experiment tracking
+
+- `outputs/{run_name}/` — full runs (gitignored)
+- `dry-runs/{run_name}/` — dry runs (gitignored)
+- Each run writes `run_info.json` (git hash, config, architecture) and `train_log.txt`
+- **Always commit before starting an `exp_` run** so `run_info.json` captures the exact code
 
 ## Git conventions
 
 - Never add `Co-Authored-By: Claude` or any AI authorship trailer to commit messages.
+- Always commit before running a full experiment.

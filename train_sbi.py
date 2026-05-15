@@ -170,7 +170,9 @@ def main():
     log_path = run_dir / "train_log.txt"
     log_fh = open(log_path, "w")
     _real_stdout = sys.stdout
+    _real_stderr = sys.stderr
     sys.stdout = Tee(log_fh)
+    sys.stderr = Tee(log_fh)
 
     def log(msg):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -244,6 +246,7 @@ def main():
 
     log_fh.close()
     sys.stdout = _real_stdout
+    sys.stderr = _real_stderr
     print(f"\nLog written to {log_path}")
 
 
