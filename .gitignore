@@ -7,3 +7,4 @@ outputs/
 sbi-logs/
 .DS_Store
 nohup.out
+*.log
