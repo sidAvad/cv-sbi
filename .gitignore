@@ -3,7 +3,8 @@ __pycache__/
 *.pyc
 norm_stats.json
 logs/
-checkpoints/
 dry-runs/
+outputs/
 sbi-logs/
 .DS_Store
+nohup.out
