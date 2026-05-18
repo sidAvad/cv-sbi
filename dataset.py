@@ -36,6 +36,47 @@ N_PARAMS = len(PARAM_KEYS)       # 25
 N_CHANNELS = len(WAVE_KEYS_CONT) + len(WAVE_KEYS_VALVE)  # 28
 T = 201
 
+# Channel group slices within the stacked (N_CHANNELS, T) tensor
+_SLICE_P     = slice(0, 8)   # Pap..Pvs  — pressure
+_SLICE_Q     = slice(8, 16)  # Qap..Qvs  — flow
+_SLICE_V     = slice(16, 24) # Vap..Vvs  — volume
+_SLICE_VALVE = slice(24, 28) # av,mv,pv,tv
+
+# 4*8 + 3*8 + 3*8 + 1*4
+N_SUMSTATS = 84
+
+
+def compute_summary_stats(x: torch.Tensor) -> torch.Tensor:
+    """
+    x : (N, N_CHANNELS*T) flat z-scored waveforms
+    returns (N, N_SUMSTATS=84) domain-specific summary statistics
+
+    Pressure (8 ch): mean, systolic (max), diastolic (min), pulse pressure
+    Flow     (8 ch): mean, peak (max), min
+    Volume   (8 ch): EDV (max), ESV (min), stroke volume (max-min)
+    Valves   (4 ch): fraction of time open (mean)
+    """
+    w = x.view(x.shape[0], N_CHANNELS, T)
+
+    p = w[:, _SLICE_P, :]
+    p_sys = p.amax(-1)
+    p_dia = p.amin(-1)
+
+    q = w[:, _SLICE_Q, :]
+
+    v = w[:, _SLICE_V, :]
+    v_ed = v.amax(-1)
+    v_es = v.amin(-1)
+
+    valve = w[:, _SLICE_VALVE, :]
+
+    return torch.cat([
+        p.mean(-1), p_sys, p_dia, p_sys - p_dia,   # 4*8 = 32
+        q.mean(-1), q.amax(-1), q.amin(-1),          # 3*8 = 24
+        v_ed, v_es, v_ed - v_es,                     # 3*8 = 24
+        valve.mean(-1),                              #   4
+    ], dim=-1)
+
 
 class CVDataset(Dataset):
     def __init__(self, data_dir, index_entries, stats):

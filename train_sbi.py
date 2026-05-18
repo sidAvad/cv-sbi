@@ -22,7 +22,11 @@ from sbi.inference import NPE
 from sbi.neural_nets import posterior_nn
 from sbi.utils import BoxUniform
 
-from dataset import CVDataset, PARAM_KEYS, N_CHANNELS, T, load_stats, load_manifest
+from dataset import (
+    CVDataset, PARAM_KEYS, N_CHANNELS, T,
+    load_stats, load_manifest,
+    compute_summary_stats, N_SUMSTATS,
+)
 
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -159,6 +163,8 @@ class Tee:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True, help="e.g. exp_baseline or dry-run_smoke")
+    parser.add_argument("--embedding", choices=["cnn", "sumstats"], default="cnn",
+                        help="Observation embedding: learned CNN (default) or hand-crafted summary stats")
     args = parser.parse_args()
 
     run_type, run_name, run_dir = parse_run(args.run)
@@ -178,9 +184,19 @@ def main():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
     log(f"Run: {run_name}  ({'dry-run' if is_dry else 'full'})")
-    log(f"Device: {DEVICE}")
+    log(f"Device: {DEVICE}  embedding: {args.embedding}")
 
-    embedding = WaveformEmbedding()
+    use_sumstats = args.embedding == "sumstats"
+
+    if use_sumstats:
+        embedding_net = nn.Identity()
+        embedding_info = {"type": "sumstats", "n_features": N_SUMSTATS,
+                          "features": "pressure(mean,sys,dia,pp)*8 + flow(mean,peak,min)*8 + volume(EDV,ESV,SV)*8 + valve(open_frac)*4"}
+        z_score_x = "independent"
+    else:
+        embedding_net = WaveformEmbedding()
+        embedding_info = embedding_net.describe()
+        z_score_x = "none"
 
     run_info = dict(
         run=run_name,
@@ -194,13 +210,13 @@ def main():
             data_dir=str(DATA_DIR),
             manifest=str(MANIFEST),
         ),
-        embedding=embedding.describe(),
+        embedding=embedding_info,
         flow=dict(
             model="maf",
             hidden_features=HIDDEN_FEATURES,
             num_transforms=NUM_TRANSFORMS,
             z_score_theta="independent",
-            z_score_x="none",
+            z_score_x=z_score_x,
         ),
         training=dict(
             batch_size=BATCH_SIZE,
@@ -216,15 +232,20 @@ def main():
     log(f"Loading {n_sims:,} simulations...")
     theta, x = load_simulations(manifest, stats, n_sims, log)
 
+    if use_sumstats:
+        log("Computing summary statistics...")
+        x = compute_summary_stats(x)
+        log(f"Summary stats shape: {tuple(x.shape)}")
+
     prior = build_prior(manifest)
 
     density_estimator_fn = posterior_nn(
         model="maf",
-        embedding_net=embedding,
+        embedding_net=embedding_net,
         hidden_features=HIDDEN_FEATURES,
         num_transforms=NUM_TRANSFORMS,
         z_score_theta="independent",
-        z_score_x="none",
+        z_score_x=z_score_x,
     )
 
     inference = NPE(prior=prior, density_estimator=density_estimator_fn, device=DEVICE)
