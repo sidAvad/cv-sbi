@@ -1,0 +1,16 @@
+sync:
+  cv-sbi-adamant:
+    alpha: "."
+    beta: "sa4604@adamant:~/cv-sbi"
+    mode: "two-way-resolved"
+    ignore:
+      paths:
+        - ".git"
+        - ".venv"
+        - "__pycache__"
+        - "*.pyc"
+        - "outputs/"
+        - "sbi-logs/"
+        - "*.log"
+        - ".DS_Store"
+        - "nohup.out"

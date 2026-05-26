@@ -8,3 +8,4 @@ sbi-logs/
 .DS_Store
 nohup.out
 *.log
+mutagen.yml.lock
