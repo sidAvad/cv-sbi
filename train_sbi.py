@@ -3,13 +3,15 @@ Train a Neural Posterior Estimator (NPE) over 25 cardiovascular parameters
 using pre-simulated (theta, waveform) pairs from HDF5 files.
 
 Usage:
-    python train_sbi.py --run exp_baseline
-    python train_sbi.py --run dry-run_smoke
+    python train_sbi.py --run exp_baseline_cnn4e64_maf5 --data-root /media/pulsar/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314
+    python train_sbi.py --run dry_sumstats_maf5 --data-root /path/to/dataset
+
+--data-root should point to the dataset root directory, which must contain
+train/ and manifest_train.json.
 """
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from datetime import datetime
@@ -31,8 +33,6 @@ from dataset import (
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
-DATA_DIR    = Path("/media/8TBNVME/data/neh10/hdf5/cv8/simset_10M_cv8Eed_20260314/train")
-MANIFEST    = DATA_DIR.parent / "manifest_train.json"
 STATS_PATH  = Path("norm_stats.json")
 
 N_SIMS_FULL    = 100_000
@@ -104,9 +104,9 @@ def build_prior(manifest: dict) -> BoxUniform:
 
 # ─── Data loading ─────────────────────────────────────────────────────────────
 
-def load_simulations(manifest: dict, stats: dict, n: int, log):
+def load_simulations(data_dir: Path, manifest: dict, stats: dict, n: int, log):
     index = manifest["index"][:n]
-    dataset = CVDataset(str(DATA_DIR), index, stats)
+    dataset = CVDataset(str(data_dir), index, stats)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
     thetas, xs = [], []
@@ -126,12 +126,12 @@ def load_simulations(manifest: dict, stats: dict, n: int, log):
 # ─── Run management ───────────────────────────────────────────────────────────
 
 def parse_run(name: str):
-    if name.startswith("dry-run_"):
-        return "dry-run", name, Path("dry-runs") / name
+    if name.startswith("dry_"):
+        return "dry", name, Path("dry-runs") / name
     elif name.startswith("exp_"):
         return "exp", name, Path("outputs") / name
     else:
-        raise ValueError("--run must start with 'exp_' or 'dry-run_'")
+        raise ValueError("--run must start with 'exp_' or 'dry_'")
 
 
 def git_hash() -> str:
@@ -162,13 +162,17 @@ class Tee:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run", required=True, help="e.g. exp_baseline or dry-run_smoke")
+    parser.add_argument("--run", required=True, help="e.g. exp_cnn4e64_maf5 or dry_sumstats_maf5")
+    parser.add_argument("--data-root", required=True, help="Dataset root containing train/ and manifest_train.json")
     parser.add_argument("--embedding", choices=["cnn", "sumstats"], default="cnn",
                         help="Observation embedding: learned CNN (default) or hand-crafted summary stats")
     args = parser.parse_args()
 
     run_type, run_name, run_dir = parse_run(args.run)
-    is_dry = run_type == "dry-run"
+    is_dry = run_type == "dry"
+    data_root = Path(args.data_root)
+    data_dir = data_root / "train"
+    manifest_path = data_root / "manifest_train.json"
     n_sims = N_SIMS_DRYRUN if is_dry else N_SIMS_FULL
 
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -183,7 +187,7 @@ def main():
     def log(msg):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-    log(f"Run: {run_name}  ({'dry-run' if is_dry else 'full'})")
+    log(f"Run: {run_name}  ({'dry' if is_dry else 'full'})")
     log(f"Device: {DEVICE}  embedding: {args.embedding}")
 
     use_sumstats = args.embedding == "sumstats"
@@ -207,8 +211,8 @@ def main():
         device=DEVICE,
         data=dict(
             n_sims=n_sims,
-            data_dir=str(DATA_DIR),
-            manifest=str(MANIFEST),
+            data_dir=str(data_dir),
+            manifest=str(manifest_path),
         ),
         embedding=embedding_info,
         flow=dict(
@@ -226,11 +230,11 @@ def main():
     log(f"run_info.json written  git={run_info['git_hash']}")
 
     log("Loading manifest and stats...")
-    manifest = load_manifest(MANIFEST)
+    manifest = load_manifest(manifest_path)
     stats    = load_stats(STATS_PATH)
 
     log(f"Loading {n_sims:,} simulations...")
-    theta, x = load_simulations(manifest, stats, n_sims, log)
+    theta, x = load_simulations(data_dir, manifest, stats, n_sims, log)
 
     if use_sumstats:
         log("Computing summary statistics...")
@@ -263,7 +267,7 @@ def main():
         torch.save(posterior, run_dir / "posterior.pt")
         log(f"Saved posterior to {run_dir / 'posterior.pt'}")
     else:
-        log("Dry-run complete — posterior not saved.")
+        log("Dry run complete — posterior not saved.")
 
     log_fh.close()
     sys.stdout = _real_stdout

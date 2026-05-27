@@ -16,8 +16,9 @@ Forked from `cv-inverse-autoencoder` (the surrogate training repo).
 
 ## Data layout
 
-- HDF5 files at `/media/8TBNVME/data/neh10/hdf5/cv8/simset_10M_cv8Eed_20260314/train/` and `test/`
-- `manifest_train.json` / `manifest_test.json` live one level above the data dirs
+- HDF5 files under `<data-root>/train/` and `<data-root>/test/`; pass the root via `--data-root`
+  - Adamant: `/media/pulsar/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314`
+- `manifest_train.json` / `manifest_test.json` live at `<data-root>/` (one level above the data dirs)
 - Each HDF5 group (`sim_NNNNNN`) holds `parameters/<key>` scalars and `waves/<key>` arrays of length 201
 - `norm_stats.json`: wave normalisation stats (not committed)
 - 25 variable parameters defined by `pvar_low`/`pvar_high` in manifest config
@@ -34,11 +35,12 @@ Forked from `cv-inverse-autoencoder` (the surrogate training repo).
 
 `{type}_{series}_{embedding}_{flow}[_{extras}]`
 
-- type: `exp_` (full run) or `dry-run_` (512 sims, smoke test, no posterior saved)
+- type: `exp` (full run) or `dry` (512 sims, smoke test, no posterior saved)
 - embedding: `cnn4e64` (4-block CNN, 64-dim), `sumstats` (hand-crafted summary stats), etc.
 - flow: `maf5` (MAF, 5 transforms), `nsf8`, etc.
+- training-method: describes what is frozen/ablated, e.g. `freeze-maf`, `freeze-input`, `ablate`
 
-Examples: `exp_baseline_cnn4e64_maf5`, `exp_v2_sumstats_maf5`, `dry-run_sumstats`
+Examples: `exp_cnn4e64_maf5_freeze-maf`, `dry_sumstats_maf5`
 
 ## Experiment tracking
 
