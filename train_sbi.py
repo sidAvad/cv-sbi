@@ -25,7 +25,10 @@ from sbi.neural_nets import posterior_nn
 from sbi.utils import BoxUniform
 
 from dataset import (
-    CVDataset, PARAM_KEYS, N_CHANNELS, T,
+    CVDataset, ReducedCVDataset,
+    PARAM_KEYS, PARAM_KEYS_INFER,
+    N_CHANNELS, T,
+    N_REDUCED_CHANNELS, N_SCALARS, OBS_DIM,
     load_stats, load_manifest,
     compute_summary_stats, N_SUMSTATS,
 )
@@ -90,23 +93,72 @@ class WaveformEmbedding(nn.Module):
         return self.proj(h)
 
 
+# ─── Reduced embedding net ───────────────────────────────────────────────────
+
+class ReducedWaveformEmbedding(nn.Module):
+    """4-channel pressure CNN + 5 scalars → embed_dim + N_SCALARS."""
+
+    CONV_LAYERS = [
+        (N_REDUCED_CHANNELS, 64,  7, 1),
+        (64,                 128, 5, 2),
+        (128,                256, 5, 2),
+        (256,                256, 3, 1),
+    ]
+
+    def __init__(self, embed_dim: int = EMBED_DIM):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.wave_len = N_REDUCED_CHANNELS * T  # 804
+
+        layers = []
+        for in_ch, out_ch, k, s in self.CONV_LAYERS:
+            layers += [nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2, stride=s), nn.SiLU()]
+        self.cnn = nn.Sequential(*layers)
+        self.proj = nn.Linear(self.CONV_LAYERS[-1][1], embed_dim)
+
+    @property
+    def output_dim(self):
+        return self.embed_dim + N_SCALARS
+
+    def describe(self) -> dict:
+        return {
+            "type": "ReducedWaveformEmbedding",
+            "input_waveforms": f"({N_REDUCED_CHANNELS}, {T})",
+            "input_scalars": "Pas_mean, Pas_max, Pas_min, SV, HR_z",
+            "conv_layers": [
+                {"in": ic, "out": oc, "kernel": k, "stride": s}
+                for ic, oc, k, s in self.CONV_LAYERS
+            ],
+            "pooling": "global_avg",
+            "embed_dim": self.embed_dim,
+            "output_dim": self.output_dim,
+            "n_params": sum(p.numel() for p in self.parameters()),
+        }
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        waves   = x[:, :self.wave_len].view(-1, N_REDUCED_CHANNELS, T)
+        scalars = x[:, self.wave_len:]                                   # (B, 5)
+        h = self.cnn(waves).mean(dim=-1)
+        return torch.cat([self.proj(h), scalars], dim=-1)
+
+
 # ─── Prior ────────────────────────────────────────────────────────────────────
 
-def build_prior(manifest: dict) -> BoxUniform:
+def build_prior(manifest: dict, param_keys: list) -> BoxUniform:
     lo = manifest["config"]["pvar_low"]
     hi = manifest["config"]["pvar_high"]
     return BoxUniform(
-        low=torch.tensor([lo[k] for k in PARAM_KEYS], dtype=torch.float32),
-        high=torch.tensor([hi[k] for k in PARAM_KEYS], dtype=torch.float32),
+        low=torch.tensor([lo[k] for k in param_keys], dtype=torch.float32),
+        high=torch.tensor([hi[k] for k in param_keys], dtype=torch.float32),
         device=DEVICE,
     )
 
 
 # ─── Data loading ─────────────────────────────────────────────────────────────
 
-def load_simulations(data_dir: Path, manifest: dict, stats: dict, n: int, log):
+def load_simulations(data_dir: Path, manifest: dict, stats: dict, n: int, log, dataset_cls):
     index = manifest["index"][:n]
-    dataset = CVDataset(str(data_dir), index, stats)
+    dataset = dataset_cls(str(data_dir), index, stats)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
     thetas, xs = [], []
@@ -158,27 +210,37 @@ class Tee:
         self._stdout.flush()
 
 
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run", required=True, help="e.g. exp_cnn4e64_maf5 or dry_sumstats_maf5")
-    parser.add_argument("--data-root", required=True, help="Dataset root containing train/ and manifest_train.json")
-    parser.add_argument("--embedding", choices=["cnn", "sumstats"], default="cnn",
-                        help="Observation embedding: learned CNN (default) or hand-crafted summary stats")
+    parser.add_argument("--run", required=True,
+                        help="e.g. exp_cnn4e64_maf5_freeze-maf or dry_cnn4e64_maf5")
+    parser.add_argument("--data-root", required=True,
+                        help="Dataset root containing train/ and manifest_train.json")
+    parser.add_argument("--embedding", choices=["cnn", "sumstats", "cnn-reduced"],
+                        default="cnn",
+                        help="cnn: full 28-ch CNN; cnn-reduced: 4 pressure waves + scalars; sumstats: hand-crafted")
+    parser.add_argument("--freeze-epochs", type=int, default=0,
+                        help="Epochs to train embedding only before joint training (0 = no freeze)")
     args = parser.parse_args()
 
     run_type, run_name, run_dir = parse_run(args.run)
-    is_dry = run_type == "dry"
-    data_root = Path(args.data_root)
-    data_dir = data_root / "train"
+    is_dry      = run_type == "dry"
+    use_reduced = args.embedding == "cnn-reduced"
+    use_sumstats = args.embedding == "sumstats"
+    data_root   = Path(args.data_root)
+    data_dir    = data_root / "train"
     manifest_path = data_root / "manifest_train.json"
     n_sims = N_SIMS_DRYRUN if is_dry else N_SIMS_FULL
 
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    log_path = run_dir / "train_log.txt"
-    log_fh = open(log_path, "w")
+    date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = run_dir / f"train_{run_name}_{date_str}.log"
+    log_fh   = open(log_path, "w")
     _real_stdout = sys.stdout
     _real_stderr = sys.stderr
     sys.stdout = Tee(log_fh)
@@ -190,17 +252,27 @@ def main():
     log(f"Run: {run_name}  ({'dry' if is_dry else 'full'})")
     log(f"Device: {DEVICE}  embedding: {args.embedding}")
 
-    use_sumstats = args.embedding == "sumstats"
-
-    if use_sumstats:
+    if use_reduced:
+        embedding_net = ReducedWaveformEmbedding()
+        embedding_info = embedding_net.describe()
+        z_score_x  = "none"
+        dataset_cls = ReducedCVDataset
+        param_keys  = PARAM_KEYS_INFER
+    elif use_sumstats:
         embedding_net = nn.Identity()
-        embedding_info = {"type": "sumstats", "n_features": N_SUMSTATS,
-                          "features": "pressure(mean,sys,dia,pp)*8 + flow(mean,peak,min)*8 + volume(EDV,ESV,SV)*8 + valve(open_frac)*4"}
-        z_score_x = "independent"
+        embedding_info = {
+            "type": "sumstats", "n_features": N_SUMSTATS,
+            "features": "pressure(mean,sys,dia,pp)*8 + flow(mean,peak,min)*8 + volume(EDV,ESV,SV)*8 + valve(open_frac)*4",
+        }
+        z_score_x   = "independent"
+        dataset_cls = CVDataset
+        param_keys  = PARAM_KEYS
     else:
         embedding_net = WaveformEmbedding()
         embedding_info = embedding_net.describe()
-        z_score_x = "none"
+        z_score_x   = "none"
+        dataset_cls = CVDataset
+        param_keys  = PARAM_KEYS
 
     run_info = dict(
         run=run_name,
@@ -224,6 +296,7 @@ def main():
         ),
         training=dict(
             batch_size=BATCH_SIZE,
+            freeze_epochs=args.freeze_epochs,
         ),
     )
     (run_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
@@ -234,14 +307,14 @@ def main():
     stats    = load_stats(STATS_PATH)
 
     log(f"Loading {n_sims:,} simulations...")
-    theta, x = load_simulations(data_dir, manifest, stats, n_sims, log)
+    theta, x = load_simulations(data_dir, manifest, stats, n_sims, log, dataset_cls)
 
     if use_sumstats:
         log("Computing summary statistics...")
         x = compute_summary_stats(x)
         log(f"Summary stats shape: {tuple(x.shape)}")
 
-    prior = build_prior(manifest)
+    prior = build_prior(manifest, param_keys)
 
     density_estimator_fn = posterior_nn(
         model="maf",
@@ -255,8 +328,27 @@ def main():
     inference = NPE(prior=prior, density_estimator=density_estimator_fn, device=DEVICE)
     inference.append_simulations(theta, x)
 
-    log("Training NPE...")
+    if args.freeze_epochs > 0:
+        log("Initialising network (1 epoch, all params)...")
+        inference.train(max_num_epochs=1, training_batch_size=BATCH_SIZE,
+                        show_train_summary=False)
+
+        log(f"Phase 1: freeze MAF, train embedding for {args.freeze_epochs} epochs...")
+        for name, p in inference._neural_net.named_parameters():
+            if "embedding_net" not in name:
+                p.requires_grad_(False)
+        inference.train(resume_training=True, max_num_epochs=args.freeze_epochs,
+                        training_batch_size=BATCH_SIZE, show_train_summary=False)
+
+        log("Phase 2: joint training (MAF unfrozen, sbi early stopping)...")
+        for p in inference._neural_net.parameters():
+            p.requires_grad_(True)
+
+    else:
+        log("Training NPE...")
+
     density_estimator = inference.train(
+        resume_training=args.freeze_epochs > 0,
         training_batch_size=BATCH_SIZE,
         show_train_summary=True,
     )

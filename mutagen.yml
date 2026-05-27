@@ -10,6 +10,7 @@ sync:
         - "__pycache__"
         - "*.pyc"
         - "outputs/"
+        - "dry-runs/"
         - "sbi-logs/"
         - "*.log"
         - ".DS_Store"

@@ -5,9 +5,11 @@ batch file and save to norm_stats.json.
 Loads all 10k sims from 1.h5 into numpy arrays, then just calls .mean() and
 .std(). Simple and fast enough — no online algorithms needed at this scale.
 
-Run this once before train.py.
+Run this once before train_sbi.py:
+    python compute_stats.py --data-root /media/pulsar/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314
 """
 
+import argparse
 import json
 from pathlib import Path
 
@@ -15,11 +17,6 @@ import h5py
 import numpy as np
 
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-
-DATA_DIR = Path(
-    "/media/8TBNVME/data/neh10/hdf5/cv8/simset_10M_cv8Eed_20260314/train"
-)
 SOURCE_FILE = "1.h5"
 STATS_PATH = Path("norm_stats.json")
 
@@ -42,7 +39,13 @@ WAVE_KEYS_CONT = [
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    src = DATA_DIR / SOURCE_FILE
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", required=True,
+                        help="Dataset root containing train/ and manifest_train.json")
+    args = parser.parse_args()
+    data_dir = Path(args.data_root) / "train"
+
+    src = data_dir / SOURCE_FILE
     if not src.exists():
         raise FileNotFoundError(f"Source file not found: {src}")
 

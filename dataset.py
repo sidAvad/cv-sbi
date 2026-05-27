@@ -1,9 +1,11 @@
 """
 PyTorch Dataset for SBI over cardiovascular physiology.
 
-Returns raw (unnormalized) parameters as theta, and all 28 waveforms
-(24 continuous z-scored + 4 binary valves) stacked as a flat observation
-vector for sbi's append_simulations.
+Two dataset modes:
+- CVDataset: all 28 waveforms (24 continuous z-scored + 4 binary valves),
+  25-param theta. Used for the full-channel CNN baseline.
+- ReducedCVDataset: 4 pressure waveforms + 5 scalars (Pas mean/max/min, SV,
+  HR), 24-param theta (HR moved to observation). Used for the reduced-input CNN.
 """
 
 import json
@@ -23,6 +25,10 @@ PARAM_KEYS = [
     "HR", "Rap", "Ras", "Tmax", "Tmax_a",
     "Vs", "τ", "τ_a",
 ]
+
+# HR is observable (measured), so it moves from theta to x in the reduced mode
+_HR_IDX = PARAM_KEYS.index("HR")
+PARAM_KEYS_INFER = [k for k in PARAM_KEYS if k != "HR"]  # 24-dim
 
 WAVE_KEYS_CONT = [
     "Pap", "Pas", "Pla", "Plv", "Pra", "Prv", "Pvp", "Pvs",
@@ -44,6 +50,14 @@ _SLICE_VALVE = slice(24, 28) # av,mv,pv,tv
 
 # 4*8 + 3*8 + 3*8 + 1*4
 N_SUMSTATS = 84
+
+# ── Reduced observation constants ─────────────────────────────────────────────
+WAVE_KEYS_REDUCED = ["Prv", "Pra", "Pvp", "Pap"]  # 4 pressure waveforms
+_PAS_IDX = WAVE_KEYS_CONT.index("Pas")
+_VLV_IDX = WAVE_KEYS_CONT.index("Vlv")
+N_REDUCED_CHANNELS = len(WAVE_KEYS_REDUCED)        # 4
+N_SCALARS          = 5                              # Pas mean/max/min, SV, HR
+OBS_DIM            = N_REDUCED_CHANNELS * T + N_SCALARS  # 809
 
 
 def compute_summary_stats(x: torch.Tensor) -> torch.Tensor:
@@ -123,6 +137,91 @@ class CVDataset(Dataset):
         x = torch.cat([waves_cont, waves_valve], dim=0).reshape(-1)
 
         return theta, x
+
+    def close(self):
+        for fh in self._handles.values():
+            fh.close()
+        self._handles.clear()
+
+
+class ReducedCVDataset(Dataset):
+    """
+    Returns (theta_infer, x_reduced) where:
+      theta_infer : (24,)  — all params except HR
+      x_reduced   : (809,) — 4 z-scored waveforms (4*201) + 5 scalars
+                             scalars: Pas mean, Pas max, Pas min, SV, HR_z
+    """
+
+    def __init__(self, data_dir, index_entries, stats):
+        self.data_dir = data_dir
+        self.index = index_entries
+        self._handles = {}
+
+        w = stats["waves"]
+        p = stats["parameters"]
+
+        # Z-score tensors for the 4 selected waveforms
+        self.wave_mean = torch.tensor(
+            [w[k]["mean"] for k in WAVE_KEYS_REDUCED], dtype=torch.float32
+        ).unsqueeze(1)
+        self.wave_std = torch.tensor(
+            [w[k]["std"] for k in WAVE_KEYS_REDUCED], dtype=torch.float32
+        ).unsqueeze(1)
+
+        # Z-score scalars for Pas and Vlv (used to compute scalars)
+        self._pas_mean = w["Pas"]["mean"]
+        self._pas_std  = w["Pas"]["std"] + 1e-8
+        self._vlv_mean = w["Vlv"]["mean"]
+        self._vlv_std  = w["Vlv"]["std"] + 1e-8
+
+        # Z-score for HR (from parameter stats)
+        self._hr_mean = p["HR"]["mean"]
+        self._hr_std  = p["HR"]["std"] + 1e-8
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        entry = self.index[idx]
+        path = os.path.join(self.data_dir, entry["file"])
+        if path not in self._handles:
+            self._handles[path] = h5py.File(path, "r")
+        g = self._handles[path][entry["group"]]
+
+        # theta: drop HR
+        theta = torch.tensor(
+            [float(g[f"parameters/{k}"][()]) for k in PARAM_KEYS],
+            dtype=torch.float32,
+        )
+        hr_raw = theta[_HR_IDX].item()
+        theta_infer = torch.cat([theta[:_HR_IDX], theta[_HR_IDX + 1:]])  # (24,)
+
+        # 4 selected waveforms, z-scored
+        waves = torch.from_numpy(
+            np.stack([g[f"waves/{k}"][:] for k in WAVE_KEYS_REDUCED]).astype(np.float32)
+        )
+        waves = (waves - self.wave_mean) / (self.wave_std + 1e-8)  # (4, 201)
+
+        # Scalars from Pas (z-scored waveform)
+        pas_z = torch.from_numpy(g["waves/Pas"][:].astype(np.float32))
+        pas_z = (pas_z - self._pas_mean) / self._pas_std
+        pas_mean = pas_z.mean()
+        pas_max  = pas_z.max()
+        pas_min  = pas_z.min()
+
+        # SV from z-scored Vlv
+        vlv_z = torch.from_numpy(g["waves/Vlv"][:].astype(np.float32))
+        vlv_z = (vlv_z - self._vlv_mean) / self._vlv_std
+        sv = vlv_z.max() - vlv_z.min()
+
+        # HR z-scored
+        hr_z = torch.tensor((hr_raw - self._hr_mean) / self._hr_std, dtype=torch.float32)
+
+        scalars = torch.stack([pas_mean, pas_max, pas_min, sv, hr_z])  # (5,)
+
+        x = torch.cat([waves.reshape(-1), scalars])  # (809,)
+
+        return theta_infer, x
 
     def close(self):
         for fh in self._handles.values():
