@@ -72,6 +72,7 @@ class WaveformEmbedding(nn.Module):
         for in_ch, out_ch, k, s in self.CONV_LAYERS:
             layers += [nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2, stride=s), nn.SiLU()]
         self.cnn = nn.Sequential(*layers)
+        self.attn_pool = nn.Linear(self.CONV_LAYERS[-1][1], 1)
         self.proj = nn.Linear(self.CONV_LAYERS[-1][1], embed_dim)
 
     def describe(self) -> dict:
@@ -82,14 +83,16 @@ class WaveformEmbedding(nn.Module):
                 {"in": ic, "out": oc, "kernel": k, "stride": s}
                 for ic, oc, k, s in self.CONV_LAYERS
             ],
-            "pooling": "global_avg",
+            "pooling": "attention",
             "embed_dim": self.embed_dim,
             "n_params": sum(p.numel() for p in self.parameters()),
         }
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.view(-1, self.n_channels, self.t)
-        h = self.cnn(x).mean(dim=-1)
+        h = self.cnn(x).transpose(1, 2)          # (B, T', 256)
+        w = self.attn_pool(h).softmax(dim=1)      # (B, T', 1)
+        h = (w * h).sum(dim=1)                    # (B, 256)
         return self.proj(h)
 
 
