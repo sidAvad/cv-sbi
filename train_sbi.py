@@ -99,7 +99,7 @@ class WaveformEmbedding(nn.Module):
 # ─── Reduced embedding net ───────────────────────────────────────────────────
 
 class ReducedWaveformEmbedding(nn.Module):
-    """4-channel pressure CNN + 5 scalars → embed_dim + N_SCALARS."""
+    """4-channel pressure CNN + 5 scalars as prefix tokens → attention pool → embed_dim."""
 
     CONV_LAYERS = [
         (N_REDUCED_CHANNELS, 64,  7, 1),
@@ -112,27 +112,31 @@ class ReducedWaveformEmbedding(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.wave_len = N_REDUCED_CHANNELS * T  # 804
+        feat_dim = self.CONV_LAYERS[-1][1]       # 256
 
         layers = []
         for in_ch, out_ch, k, s in self.CONV_LAYERS:
             layers += [nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2, stride=s), nn.SiLU()]
         self.cnn = nn.Sequential(*layers)
-        self.proj = nn.Linear(self.CONV_LAYERS[-1][1], embed_dim)
+        self.scalar_projs = nn.ModuleList([nn.Linear(1, feat_dim) for _ in range(N_SCALARS)])
+        self.attn_pool = nn.Linear(feat_dim, 1)
+        self.proj = nn.Linear(feat_dim, embed_dim)
 
     @property
     def output_dim(self):
-        return self.embed_dim + N_SCALARS
+        return self.embed_dim
 
     def describe(self) -> dict:
         return {
             "type": "ReducedWaveformEmbedding",
             "input_waveforms": f"({N_REDUCED_CHANNELS}, {T})",
             "input_scalars": "Pas_mean, Pas_max, Pas_min, SV, HR_z",
+            "scalar_integration": "prefix_tokens_before_attn_pool",
             "conv_layers": [
                 {"in": ic, "out": oc, "kernel": k, "stride": s}
                 for ic, oc, k, s in self.CONV_LAYERS
             ],
-            "pooling": "global_avg",
+            "pooling": "attention",
             "embed_dim": self.embed_dim,
             "output_dim": self.output_dim,
             "n_params": sum(p.numel() for p in self.parameters()),
@@ -140,9 +144,17 @@ class ReducedWaveformEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         waves   = x[:, :self.wave_len].view(-1, N_REDUCED_CHANNELS, T)
-        scalars = x[:, self.wave_len:]                                   # (B, 5)
-        h = self.cnn(waves).mean(dim=-1)
-        return torch.cat([self.proj(h), scalars], dim=-1)
+        scalars = x[:, self.wave_len:]                                    # (B, 5)
+
+        h = self.cnn(waves).transpose(1, 2)                               # (B, T', 256)
+        scalar_tokens = torch.stack(
+            [proj(scalars[:, i:i+1]) for i, proj in enumerate(self.scalar_projs)],
+            dim=1,
+        )                                                                  # (B, 5, 256)
+        h = torch.cat([scalar_tokens, h], dim=1)                          # (B, T'+5, 256)
+        w = self.attn_pool(h).softmax(dim=1)                              # (B, T'+5, 1)
+        h = (w * h).sum(dim=1)                                            # (B, 256)
+        return self.proj(h)
 
 
 # ─── Prior ────────────────────────────────────────────────────────────────────
