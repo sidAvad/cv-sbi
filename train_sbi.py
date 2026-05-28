@@ -52,7 +52,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ─── Embedding net ────────────────────────────────────────────────────────────
 
 class WaveformEmbedding(nn.Module):
-    """1D CNN: flat (28*201,) → embed_dim."""
+    """1D CNN: flat (28*201,) → embed_dim. pooling: 'attention' or 'mean'."""
 
     # Each entry: (in_ch, out_ch, kernel, stride)
     CONV_LAYERS = [
@@ -62,17 +62,19 @@ class WaveformEmbedding(nn.Module):
         (256,        256, 3, 1),
     ]
 
-    def __init__(self, embed_dim: int = EMBED_DIM):
+    def __init__(self, embed_dim: int = EMBED_DIM, pooling: str = "attention"):
         super().__init__()
         self.n_channels = N_CHANNELS
         self.t = T
         self.embed_dim = embed_dim
+        self.pooling = pooling
 
         layers = []
         for in_ch, out_ch, k, s in self.CONV_LAYERS:
             layers += [nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2, stride=s), nn.SiLU()]
         self.cnn = nn.Sequential(*layers)
-        self.attn_pool = nn.Linear(self.CONV_LAYERS[-1][1], 1)
+        if pooling == "attention":
+            self.attn_pool = nn.Linear(self.CONV_LAYERS[-1][1], 1)
         self.proj = nn.Linear(self.CONV_LAYERS[-1][1], embed_dim)
 
     def describe(self) -> dict:
@@ -83,16 +85,19 @@ class WaveformEmbedding(nn.Module):
                 {"in": ic, "out": oc, "kernel": k, "stride": s}
                 for ic, oc, k, s in self.CONV_LAYERS
             ],
-            "pooling": "attention",
+            "pooling": self.pooling,
             "embed_dim": self.embed_dim,
             "n_params": sum(p.numel() for p in self.parameters()),
         }
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.view(-1, self.n_channels, self.t)
-        h = self.cnn(x).transpose(1, 2)          # (B, T', 256)
-        w = self.attn_pool(h).softmax(dim=1)      # (B, T', 1)
-        h = (w * h).sum(dim=1)                    # (B, 256)
+        h = self.cnn(x).transpose(1, 2)              # (B, T', 256)
+        if self.pooling == "attention":
+            w = self.attn_pool(h).softmax(dim=1)      # (B, T', 1)
+            h = (w * h).sum(dim=1)                    # (B, 256)
+        else:
+            h = h.mean(dim=1)                         # (B, 256)
         return self.proj(h)
 
 
@@ -235,17 +240,18 @@ def main():
                         help="e.g. exp_cnn4e64_maf5_freeze-maf or dry_cnn4e64_maf5")
     parser.add_argument("--data-root", required=True,
                         help="Dataset root containing train/ and manifest_train.json")
-    parser.add_argument("--embedding", choices=["cnn", "sumstats", "cnn-reduced"],
+    parser.add_argument("--embedding", choices=["cnn", "cnn-meanpool", "sumstats", "cnn-reduced"],
                         default="cnn",
-                        help="cnn: full 28-ch CNN; cnn-reduced: 4 pressure waves + scalars; sumstats: hand-crafted")
+                        help="cnn: full 28-ch CNN attn pool; cnn-meanpool: full 28-ch CNN mean pool; cnn-reduced: 4 pressure waves + scalars; sumstats: hand-crafted")
     parser.add_argument("--freeze-epochs", type=int, default=0,
                         help="Epochs to train embedding only before joint training (0 = no freeze)")
     args = parser.parse_args()
 
     run_type, run_name, run_dir = parse_run(args.run)
-    is_dry      = run_type == "dry"
-    use_reduced = args.embedding == "cnn-reduced"
+    is_dry       = run_type == "dry"
+    use_reduced  = args.embedding == "cnn-reduced"
     use_sumstats = args.embedding == "sumstats"
+    use_meanpool = args.embedding == "cnn-meanpool"
     data_root   = Path(args.data_root)
     data_dir    = data_root / "train"
     manifest_path = data_root / "manifest_train.json"
@@ -280,6 +286,12 @@ def main():
             "features": "pressure(mean,sys,dia,pp)*8 + flow(mean,peak,min)*8 + volume(EDV,ESV,SV)*8 + valve(open_frac)*4",
         }
         z_score_x   = "independent"
+        dataset_cls = CVDataset
+        param_keys  = PARAM_KEYS
+    elif use_meanpool:
+        embedding_net = WaveformEmbedding(pooling="mean")
+        embedding_info = embedding_net.describe()
+        z_score_x   = "none"
         dataset_cls = CVDataset
         param_keys  = PARAM_KEYS
     else:
