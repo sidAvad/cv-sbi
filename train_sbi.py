@@ -92,12 +92,12 @@ class WaveformEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.view(-1, self.n_channels, self.t)
-        h = self.cnn(x).transpose(1, 2)              # (B, T', 256)
-        if self.pooling == "attention":
-            w = self.attn_pool(h).softmax(dim=1)      # (B, T', 1)
-            h = (w * h).sum(dim=1)                    # (B, 256)
+        h = self.cnn(x).transpose(1, 2)                          # (B, T', 256)
+        if getattr(self, 'pooling', 'attention') == "attention":
+            w = self.attn_pool(h).softmax(dim=1)                  # (B, T', 1)
+            h = (w * h).sum(dim=1)                                # (B, 256)
         else:
-            h = h.mean(dim=1)                         # (B, 256)
+            h = h.mean(dim=1)                                     # (B, 256)
         return self.proj(h)
 
 
