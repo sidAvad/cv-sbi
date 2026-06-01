@@ -32,6 +32,11 @@ from dataset import (
     load_stats, load_manifest,
     compute_summary_stats, N_SUMSTATS,
 )
+from models import (
+    WaveformEmbedding, ReducedWaveformEmbedding, TransformerWaveformEmbedding,
+    ReducedAutoencoderEncoder,
+    EMBED_DIM, LATENT_DIM,
+)
 
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -42,192 +47,10 @@ N_SIMS_FULL    = 100_000
 N_SIMS_DRYRUN  = 512
 
 BATCH_SIZE      = 512
-EMBED_DIM       = 64
 HIDDEN_FEATURES = 128
 NUM_TRANSFORMS  = 5
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# ─── Embedding net ────────────────────────────────────────────────────────────
-
-class WaveformEmbedding(nn.Module):
-    """1D CNN: flat (28*201,) → embed_dim. pooling: 'attention' or 'mean'."""
-
-    # Each entry: (in_ch, out_ch, kernel, stride)
-    CONV_LAYERS = [
-        (N_CHANNELS, 64,  7, 1),
-        (64,         128, 5, 2),
-        (128,        256, 5, 2),
-        (256,        256, 3, 1),
-    ]
-
-    def __init__(self, embed_dim: int = EMBED_DIM, pooling: str = "attention"):
-        super().__init__()
-        self.n_channels = N_CHANNELS
-        self.t = T
-        self.embed_dim = embed_dim
-        self.pooling = pooling
-
-        layers = []
-        for in_ch, out_ch, k, s in self.CONV_LAYERS:
-            layers += [nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2, stride=s), nn.SiLU()]
-        self.cnn = nn.Sequential(*layers)
-        if pooling == "attention":
-            self.attn_pool = nn.Linear(self.CONV_LAYERS[-1][1], 1)
-        self.proj = nn.Linear(self.CONV_LAYERS[-1][1], embed_dim)
-
-    def describe(self) -> dict:
-        return {
-            "type": "WaveformEmbedding",
-            "input": f"({self.n_channels}, {self.t})",
-            "conv_layers": [
-                {"in": ic, "out": oc, "kernel": k, "stride": s}
-                for ic, oc, k, s in self.CONV_LAYERS
-            ],
-            "pooling": self.pooling,
-            "embed_dim": self.embed_dim,
-            "n_params": sum(p.numel() for p in self.parameters()),
-        }
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.view(-1, self.n_channels, self.t)
-        h = self.cnn(x).transpose(1, 2)                          # (B, T', 256)
-        if getattr(self, 'pooling', 'attention') == "attention":
-            w = self.attn_pool(h).softmax(dim=1)                  # (B, T', 1)
-            h = (w * h).sum(dim=1)                                # (B, 256)
-        else:
-            h = h.mean(dim=1)                                     # (B, 256)
-        return self.proj(h)
-
-
-# ─── Reduced embedding net ───────────────────────────────────────────────────
-
-class ReducedWaveformEmbedding(nn.Module):
-    """4-channel pressure CNN + 5 scalars as prefix tokens → attention pool → embed_dim."""
-
-    CONV_LAYERS = [
-        (N_REDUCED_CHANNELS, 64,  7, 1),
-        (64,                 128, 5, 2),
-        (128,                256, 5, 2),
-        (256,                256, 3, 1),
-    ]
-
-    def __init__(self, embed_dim: int = EMBED_DIM):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.wave_len = N_REDUCED_CHANNELS * T  # 804
-        feat_dim = self.CONV_LAYERS[-1][1]       # 256
-
-        layers = []
-        for in_ch, out_ch, k, s in self.CONV_LAYERS:
-            layers += [nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2, stride=s), nn.SiLU()]
-        self.cnn = nn.Sequential(*layers)
-        self.scalar_projs = nn.ModuleList([nn.Linear(1, feat_dim) for _ in range(N_SCALARS)])
-        self.attn_pool = nn.Linear(feat_dim, 1)
-        self.proj = nn.Linear(feat_dim, embed_dim)
-
-    @property
-    def output_dim(self):
-        return self.embed_dim
-
-    def describe(self) -> dict:
-        return {
-            "type": "ReducedWaveformEmbedding",
-            "input_waveforms": f"({N_REDUCED_CHANNELS}, {T})",
-            "input_scalars": "Pas_mean, Pas_max, Pas_min, SV, HR_z",
-            "scalar_integration": "prefix_tokens_before_attn_pool",
-            "conv_layers": [
-                {"in": ic, "out": oc, "kernel": k, "stride": s}
-                for ic, oc, k, s in self.CONV_LAYERS
-            ],
-            "pooling": "attention",
-            "embed_dim": self.embed_dim,
-            "output_dim": self.output_dim,
-            "n_params": sum(p.numel() for p in self.parameters()),
-        }
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        waves   = x[:, :self.wave_len].view(-1, N_REDUCED_CHANNELS, T)
-        scalars = x[:, self.wave_len:]                                    # (B, 5)
-
-        h = self.cnn(waves).transpose(1, 2)                               # (B, T', 256)
-        scalar_tokens = torch.stack(
-            [proj(scalars[:, i:i+1]) for i, proj in enumerate(self.scalar_projs)],
-            dim=1,
-        )                                                                  # (B, 5, 256)
-        h = torch.cat([scalar_tokens, h], dim=1)                          # (B, T'+5, 256)
-        w = self.attn_pool(h).softmax(dim=1)                              # (B, T'+5, 1)
-        h = (w * h).sum(dim=1)                                            # (B, 256)
-        return self.proj(h)
-
-
-# ─── Transformer embedding net ───────────────────────────────────────────────
-
-class TransformerWaveformEmbedding(nn.Module):
-    """Transformer encoder: 4 pressure waveforms + 5 scalar prefix tokens → embed_dim.
-
-    201 timesteps → (B, T, 4) tokens + 5 scalar prefix tokens → (B, T+5, d_model)
-    → transformer → attention pool → embed_dim.
-    Learnable positional embeddings on waveform tokens only.
-    """
-
-    D_MODEL  = 64
-    N_HEADS  = 4
-    N_LAYERS = 3
-    FFN_DIM  = 128
-
-    def __init__(self, embed_dim: int = EMBED_DIM):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.wave_len  = N_REDUCED_CHANNELS * T  # 804
-
-        self.input_proj   = nn.Linear(N_REDUCED_CHANNELS, self.D_MODEL)
-        self.pos_emb      = nn.Embedding(T, self.D_MODEL)
-        self.scalar_projs = nn.ModuleList(
-            [nn.Linear(1, self.D_MODEL) for _ in range(N_SCALARS)]
-        )
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.D_MODEL, nhead=self.N_HEADS,
-            dim_feedforward=self.FFN_DIM, dropout=0.0,
-            batch_first=True, norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.N_LAYERS)
-        self.attn_pool   = nn.Linear(self.D_MODEL, 1)
-        self.proj        = nn.Linear(self.D_MODEL, embed_dim)
-
-    def describe(self) -> dict:
-        return {
-            "type": "TransformerWaveformEmbedding",
-            "input_waveforms": f"({N_REDUCED_CHANNELS}, {T})",
-            "input_scalars": "Pas_mean, Pas_max, Pas_min, SV, HR_z",
-            "d_model": self.D_MODEL,
-            "n_heads": self.N_HEADS,
-            "n_layers": self.N_LAYERS,
-            "ffn_dim": self.FFN_DIM,
-            "seq_len": T + N_SCALARS,
-            "pooling": "attention",
-            "embed_dim": self.embed_dim,
-            "n_params": sum(p.numel() for p in self.parameters()),
-        }
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        waves   = x[:, :self.wave_len].view(-1, T, N_REDUCED_CHANNELS)   # (B, T, 4)
-        scalars = x[:, self.wave_len:]                                     # (B, 5)
-
-        pos = torch.arange(T, device=x.device)
-        h   = self.input_proj(waves) + self.pos_emb(pos)                  # (B, T, D_MODEL)
-
-        scalar_tokens = torch.stack(
-            [proj(scalars[:, i:i+1]) for i, proj in enumerate(self.scalar_projs)],
-            dim=1,
-        )                                                                   # (B, 5, D_MODEL)
-        h = torch.cat([scalar_tokens, h], dim=1)                           # (B, T+5, D_MODEL)
-        h = self.transformer(h)                                             # (B, T+5, D_MODEL)
-
-        w = self.attn_pool(h).softmax(dim=1)                               # (B, T+5, 1)
-        h = (w * h).sum(dim=1)                                             # (B, D_MODEL)
-        return self.proj(h)                                                 # (B, embed_dim)
 
 
 # ─── Prior ────────────────────────────────────────────────────────────────────
@@ -309,11 +132,13 @@ def main():
     parser.add_argument("--data-root", required=True,
                         help="Dataset root containing train/ and manifest_train.json")
     parser.add_argument("--embedding",
-                        choices=["cnn", "cnn-meanpool", "sumstats", "cnn-reduced", "transformer-reduced"],
+                        choices=["cnn", "cnn-meanpool", "sumstats", "cnn-reduced",
+                                 "transformer-reduced", "ae-reduced"],
                         default="cnn",
                         help="cnn: full 28-ch CNN attn pool; cnn-meanpool: full 28-ch CNN mean pool; "
                              "cnn-reduced: 4-ch CNN + scalar prefix tokens; "
                              "transformer-reduced: transformer encoder on 4-ch + scalars; "
+                             "ae-reduced: load phase2_encoder.pt (ReducedAutoencoderEncoder, 128-dim); "
                              "sumstats: hand-crafted")
     parser.add_argument("--freeze-epochs", type=int, default=0,
                         help="Epochs to train embedding only before joint training (0 = no freeze)")
@@ -323,6 +148,7 @@ def main():
     is_dry          = run_type == "dry"
     use_reduced     = args.embedding == "cnn-reduced"
     use_transformer = args.embedding == "transformer-reduced"
+    use_ae_reduced  = args.embedding == "ae-reduced"
     use_sumstats    = args.embedding == "sumstats"
     use_meanpool    = args.embedding == "cnn-meanpool"
     data_root   = Path(args.data_root)
@@ -346,7 +172,20 @@ def main():
     log(f"Run: {run_name}  ({'dry' if is_dry else 'full'})")
     log(f"Device: {DEVICE}  embedding: {args.embedding}")
 
-    if use_transformer:
+    if use_ae_reduced:
+        ckpt = run_dir / "phase2_encoder.pt"
+        if not ckpt.exists():
+            raise FileNotFoundError(
+                f"{ckpt} not found. Run train_autoencoder.py --run {run_name} first."
+            )
+        enc = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM)
+        enc.load_state_dict(torch.load(ckpt, map_location="cpu"))
+        embedding_net  = enc
+        embedding_info = enc.describe()
+        z_score_x      = "none"
+        dataset_cls    = ReducedCVDataset
+        param_keys     = PARAM_KEYS_INFER
+    elif use_transformer:
         embedding_net = TransformerWaveformEmbedding()
         embedding_info = embedding_net.describe()
         z_score_x   = "none"

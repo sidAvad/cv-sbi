@@ -229,6 +229,92 @@ class ReducedCVDataset(Dataset):
         self._handles.clear()
 
 
+class PairedCVDataset(Dataset):
+    """Returns (theta, x_full, x_reduced) from the same simulation.
+
+    Used in autoencoder phase 2: train ReducedAutoencoderEncoder to reconstruct
+    full waveforms through the frozen phase-1 decoder.
+    """
+
+    def __init__(self, data_dir, index_entries, stats):
+        self.data_dir = data_dir
+        self.index    = index_entries
+        self._handles = {}
+
+        w = stats["waves"]
+        p = stats["parameters"]
+
+        self.wave_mean_full = torch.tensor(
+            [w[k]["mean"] for k in WAVE_KEYS_CONT], dtype=torch.float32
+        ).unsqueeze(1)
+        self.wave_std_full = torch.tensor(
+            [w[k]["std"] for k in WAVE_KEYS_CONT], dtype=torch.float32
+        ).unsqueeze(1)
+
+        self.wave_mean_red = torch.tensor(
+            [w[k]["mean"] for k in WAVE_KEYS_REDUCED], dtype=torch.float32
+        ).unsqueeze(1)
+        self.wave_std_red = torch.tensor(
+            [w[k]["std"] for k in WAVE_KEYS_REDUCED], dtype=torch.float32
+        ).unsqueeze(1)
+
+        self._pas_mean = w["Pas"]["mean"]
+        self._pas_std  = w["Pas"]["std"] + 1e-8
+        self._vlv_mean = w["Vlv"]["mean"]
+        self._vlv_std  = w["Vlv"]["std"] + 1e-8
+        self._hr_mean  = p["HR"]["mean"]
+        self._hr_std   = p["HR"]["std"] + 1e-8
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        entry = self.index[idx]
+        path  = os.path.join(self.data_dir, entry["file"])
+        if path not in self._handles:
+            self._handles[path] = h5py.File(path, "r")
+        g = self._handles[path][entry["group"]]
+
+        theta = torch.tensor(
+            [float(g[f"parameters/{k}"][()]) for k in PARAM_KEYS],
+            dtype=torch.float32,
+        )
+        hr_raw = theta[_HR_IDX].item()
+
+        # x_full: all 28 channels flat
+        waves_cont = torch.from_numpy(
+            np.stack([g[f"waves/{k}"][:] for k in WAVE_KEYS_CONT]).astype(np.float32)
+        )
+        waves_cont = (waves_cont - self.wave_mean_full) / (self.wave_std_full + 1e-8)
+        waves_valve = torch.from_numpy(
+            np.stack([g[f"waves/{k}"][:] for k in WAVE_KEYS_VALVE]).astype(np.float32)
+        )
+        x_full = torch.cat([waves_cont, waves_valve], dim=0).reshape(-1)  # (5628,)
+
+        # x_reduced: 4 pressure waves + 5 scalars
+        waves_red = torch.from_numpy(
+            np.stack([g[f"waves/{k}"][:] for k in WAVE_KEYS_REDUCED]).astype(np.float32)
+        )
+        waves_red = (waves_red - self.wave_mean_red) / (self.wave_std_red + 1e-8)
+
+        pas_z = torch.from_numpy(g["waves/Pas"][:].astype(np.float32))
+        pas_z = (pas_z - self._pas_mean) / self._pas_std
+        vlv_z = torch.from_numpy(g["waves/Vlv"][:].astype(np.float32))
+        vlv_z = (vlv_z - self._vlv_mean) / self._vlv_std
+        hr_z  = torch.tensor((hr_raw - self._hr_mean) / self._hr_std, dtype=torch.float32)
+
+        scalars   = torch.stack([pas_z.mean(), pas_z.max(), pas_z.min(),
+                                 vlv_z.max() - vlv_z.min(), hr_z])
+        x_reduced = torch.cat([waves_red.reshape(-1), scalars])            # (809,)
+
+        return theta, x_full, x_reduced
+
+    def close(self):
+        for fh in self._handles.values():
+            fh.close()
+        self._handles.clear()
+
+
 def load_stats(stats_path="norm_stats.json"):
     if not os.path.exists(stats_path):
         raise FileNotFoundError(f"{stats_path} not found. Run compute_stats.py first.")
