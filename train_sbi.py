@@ -162,6 +162,74 @@ class ReducedWaveformEmbedding(nn.Module):
         return self.proj(h)
 
 
+# ─── Transformer embedding net ───────────────────────────────────────────────
+
+class TransformerWaveformEmbedding(nn.Module):
+    """Transformer encoder: 4 pressure waveforms + 5 scalar prefix tokens → embed_dim.
+
+    201 timesteps → (B, T, 4) tokens + 5 scalar prefix tokens → (B, T+5, d_model)
+    → transformer → attention pool → embed_dim.
+    Learnable positional embeddings on waveform tokens only.
+    """
+
+    D_MODEL  = 64
+    N_HEADS  = 4
+    N_LAYERS = 3
+    FFN_DIM  = 128
+
+    def __init__(self, embed_dim: int = EMBED_DIM):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.wave_len  = N_REDUCED_CHANNELS * T  # 804
+
+        self.input_proj   = nn.Linear(N_REDUCED_CHANNELS, self.D_MODEL)
+        self.pos_emb      = nn.Embedding(T, self.D_MODEL)
+        self.scalar_projs = nn.ModuleList(
+            [nn.Linear(1, self.D_MODEL) for _ in range(N_SCALARS)]
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.D_MODEL, nhead=self.N_HEADS,
+            dim_feedforward=self.FFN_DIM, dropout=0.0,
+            batch_first=True, norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.N_LAYERS)
+        self.attn_pool   = nn.Linear(self.D_MODEL, 1)
+        self.proj        = nn.Linear(self.D_MODEL, embed_dim)
+
+    def describe(self) -> dict:
+        return {
+            "type": "TransformerWaveformEmbedding",
+            "input_waveforms": f"({N_REDUCED_CHANNELS}, {T})",
+            "input_scalars": "Pas_mean, Pas_max, Pas_min, SV, HR_z",
+            "d_model": self.D_MODEL,
+            "n_heads": self.N_HEADS,
+            "n_layers": self.N_LAYERS,
+            "ffn_dim": self.FFN_DIM,
+            "seq_len": T + N_SCALARS,
+            "pooling": "attention",
+            "embed_dim": self.embed_dim,
+            "n_params": sum(p.numel() for p in self.parameters()),
+        }
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        waves   = x[:, :self.wave_len].view(-1, T, N_REDUCED_CHANNELS)   # (B, T, 4)
+        scalars = x[:, self.wave_len:]                                     # (B, 5)
+
+        pos = torch.arange(T, device=x.device)
+        h   = self.input_proj(waves) + self.pos_emb(pos)                  # (B, T, D_MODEL)
+
+        scalar_tokens = torch.stack(
+            [proj(scalars[:, i:i+1]) for i, proj in enumerate(self.scalar_projs)],
+            dim=1,
+        )                                                                   # (B, 5, D_MODEL)
+        h = torch.cat([scalar_tokens, h], dim=1)                           # (B, T+5, D_MODEL)
+        h = self.transformer(h)                                             # (B, T+5, D_MODEL)
+
+        w = self.attn_pool(h).softmax(dim=1)                               # (B, T+5, 1)
+        h = (w * h).sum(dim=1)                                             # (B, D_MODEL)
+        return self.proj(h)                                                 # (B, embed_dim)
+
+
 # ─── Prior ────────────────────────────────────────────────────────────────────
 
 def build_prior(manifest: dict, param_keys: list) -> BoxUniform:
@@ -240,18 +308,23 @@ def main():
                         help="e.g. exp_cnn4e64_maf5_freeze-maf or dry_cnn4e64_maf5")
     parser.add_argument("--data-root", required=True,
                         help="Dataset root containing train/ and manifest_train.json")
-    parser.add_argument("--embedding", choices=["cnn", "cnn-meanpool", "sumstats", "cnn-reduced"],
+    parser.add_argument("--embedding",
+                        choices=["cnn", "cnn-meanpool", "sumstats", "cnn-reduced", "transformer-reduced"],
                         default="cnn",
-                        help="cnn: full 28-ch CNN attn pool; cnn-meanpool: full 28-ch CNN mean pool; cnn-reduced: 4 pressure waves + scalars; sumstats: hand-crafted")
+                        help="cnn: full 28-ch CNN attn pool; cnn-meanpool: full 28-ch CNN mean pool; "
+                             "cnn-reduced: 4-ch CNN + scalar prefix tokens; "
+                             "transformer-reduced: transformer encoder on 4-ch + scalars; "
+                             "sumstats: hand-crafted")
     parser.add_argument("--freeze-epochs", type=int, default=0,
                         help="Epochs to train embedding only before joint training (0 = no freeze)")
     args = parser.parse_args()
 
     run_type, run_name, run_dir = parse_run(args.run)
-    is_dry       = run_type == "dry"
-    use_reduced  = args.embedding == "cnn-reduced"
-    use_sumstats = args.embedding == "sumstats"
-    use_meanpool = args.embedding == "cnn-meanpool"
+    is_dry          = run_type == "dry"
+    use_reduced     = args.embedding == "cnn-reduced"
+    use_transformer = args.embedding == "transformer-reduced"
+    use_sumstats    = args.embedding == "sumstats"
+    use_meanpool    = args.embedding == "cnn-meanpool"
     data_root   = Path(args.data_root)
     data_dir    = data_root / "train"
     manifest_path = data_root / "manifest_train.json"
@@ -273,7 +346,13 @@ def main():
     log(f"Run: {run_name}  ({'dry' if is_dry else 'full'})")
     log(f"Device: {DEVICE}  embedding: {args.embedding}")
 
-    if use_reduced:
+    if use_transformer:
+        embedding_net = TransformerWaveformEmbedding()
+        embedding_info = embedding_net.describe()
+        z_score_x   = "none"
+        dataset_cls = ReducedCVDataset
+        param_keys  = PARAM_KEYS_INFER
+    elif use_reduced:
         embedding_net = ReducedWaveformEmbedding()
         embedding_info = embedding_net.describe()
         z_score_x  = "none"
