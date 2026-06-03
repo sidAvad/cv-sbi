@@ -18,8 +18,11 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.multiprocessing
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+torch.multiprocessing.set_sharing_strategy('file_system')
 from sbi.inference import NPE
 from sbi.neural_nets import posterior_nn
 from sbi.utils import BoxUniform
