@@ -9,3 +9,5 @@ sbi-logs/
 nohup.out
 *.log
 mutagen.yml.lock
+notebooks/exp_*.ipynb
+notebooks/sbi_param_eval.ipynb
