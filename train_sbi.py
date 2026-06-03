@@ -281,7 +281,7 @@ def main():
     )
 
     inference = NPE(prior=prior, density_estimator=density_estimator_fn, device=DEVICE)
-    inference.append_simulations(theta, x)
+    inference.append_simulations(theta, x, data_device='cpu')
 
     if args.freeze_epochs > 0:
         log("Initialising network (1 epoch, all params)...")
