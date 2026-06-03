@@ -142,6 +142,8 @@ def main():
                              "sumstats: hand-crafted")
     parser.add_argument("--freeze-epochs", type=int, default=0,
                         help="Epochs to train embedding only before joint training (0 = no freeze)")
+    parser.add_argument("--n-sims", type=int, default=None,
+                        help="Number of simulations to use (default: 512 for dry, 100000 for full)")
     args = parser.parse_args()
 
     run_type, run_name, run_dir = parse_run(args.run)
@@ -154,7 +156,12 @@ def main():
     data_root   = Path(args.data_root)
     data_dir    = data_root / "train"
     manifest_path = data_root / "manifest_train.json"
-    n_sims = N_SIMS_DRYRUN if is_dry else N_SIMS_FULL
+    if is_dry:
+        n_sims = N_SIMS_DRYRUN
+    elif args.n_sims is not None:
+        n_sims = args.n_sims
+    else:
+        n_sims = N_SIMS_FULL
 
     run_dir.mkdir(parents=True, exist_ok=True)
 
