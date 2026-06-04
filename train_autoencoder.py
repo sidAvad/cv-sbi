@@ -26,8 +26,11 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.multiprocessing
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, random_split
+
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 from dataset import (
     CVDataset, PairedCVDataset,
