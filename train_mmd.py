@@ -181,6 +181,8 @@ def main():
                         help="Base ae-reduced run to fine-tune")
     parser.add_argument("--real-data",     required=True,
                         help="Real data directory (multibeat recommended)")
+    parser.add_argument("--output-run",    required=True,
+                        help="Output run name, e.g. exp_..._mmd-multibeat-fixed-bw")
     parser.add_argument("--sim-data-root", required=True,
                         help="Dataset root with train/ and manifest_train.json")
     parser.add_argument("--n-sim",    type=int,   default=N_SIM_DEFAULT)
@@ -198,7 +200,7 @@ def main():
         args.patience = 999
 
     real_data_name = Path(args.real_data).name
-    mmd_run_name   = f"{args.run}_mmd-{real_data_name}"
+    mmd_run_name   = args.output_run
     base_run_dir   = Path("outputs") / args.run
     out_root       = Path("dry-runs") if args.dry_run else Path("outputs")
     mmd_run_dir    = out_root / mmd_run_name
