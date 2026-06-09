@@ -185,10 +185,12 @@ def main():
                         help="Output run name, e.g. exp_..._mmd-multibeat-fixed-bw")
     parser.add_argument("--sim-data-root", required=True,
                         help="Dataset root with train/ and manifest_train.json")
-    parser.add_argument("--n-sim",        type=int,   default=N_SIM_DEFAULT)
-    parser.add_argument("--lr",           type=float, default=LR)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--grad-clip",    type=float, default=1.0)
+    parser.add_argument("--n-sim",         type=int,   default=N_SIM_DEFAULT)
+    parser.add_argument("--lr",            type=float, default=LR)
+    parser.add_argument("--weight-decay",  type=float, default=1e-4)
+    parser.add_argument("--grad-clip",     type=float, default=1.0)
+    parser.add_argument("--anchor-weight", type=float, default=1.0,
+                        help="Weight for sim anchor loss: λ * ||enc(x_sim) - enc_frozen(x_sim)||²")
     parser.add_argument("--epochs",   type=int,   default=MAX_EPOCHS,
                         help="Training epochs (= gradient steps since all real patients used each epoch)")
     parser.add_argument("--patience", type=int,   default=PATIENCE)
@@ -239,6 +241,12 @@ def main():
     enc.load_state_dict(torch.load(ckpt, map_location=DEVICE))
     log(f"Loaded enc_reduced from {ckpt}")
 
+    # Frozen reference encoder — pins sim latents to their initial positions
+    enc_frozen = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
+    enc_frozen.load_state_dict(torch.load(ckpt, map_location=DEVICE))
+    enc_frozen.requires_grad_(False)
+    enc_frozen.eval()
+
     # Compute fixed bandwidth from initial sim latents — held constant throughout training
     # to prevent scale-invariance runaway with per-step median heuristic
     with torch.no_grad():
@@ -268,13 +276,18 @@ def main():
         idx   = torch.randperm(len(x_sim))[:SIM_BATCH]
         z_sim = enc(x_sim[idx].to(DEVICE))
 
-        loss = mmd_multiscale(z_real, z_sim, median_sq)
+        mmd_loss = mmd_multiscale(z_real, z_sim, median_sq)
+        with torch.no_grad():
+            z_sim_frozen = enc_frozen(x_sim[idx].to(DEVICE))
+        anchor_loss = torch.nn.functional.mse_loss(z_sim, z_sim_frozen)
+        loss = mmd_loss + args.anchor_weight * anchor_loss
+
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(enc.parameters(), args.grad_clip)
         opt.step()
 
-        mmd_val = loss.item()
+        mmd_val = mmd_loss.item()
 
         if mmd_val < best_mmd:
             best_mmd   = mmd_val
@@ -284,7 +297,7 @@ def main():
             wait += 1
 
         if epoch % LOG_EVERY == 0 or epoch == 1:
-            log(f"  epoch {epoch:4d}/{args.epochs}  mmd={mmd_val:.4f}  best={best_mmd:.4f}  wait={wait}")
+            log(f"  epoch {epoch:4d}/{args.epochs}  mmd={mmd_val:.4f}  anchor={anchor_loss.item():.4f}  best={best_mmd:.4f}  wait={wait}")
 
         if wait >= args.patience:
             log(f"  early stop at epoch {epoch}  best_mmd={best_mmd:.4f}")
@@ -320,6 +333,7 @@ def main():
             lr=args.lr,
             weight_decay=args.weight_decay,
             grad_clip=args.grad_clip,
+            anchor_weight=args.anchor_weight,
             max_epochs=args.epochs,
             patience=args.patience,
             sim_batch=SIM_BATCH,
