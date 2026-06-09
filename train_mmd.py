@@ -185,8 +185,10 @@ def main():
                         help="Output run name, e.g. exp_..._mmd-multibeat-fixed-bw")
     parser.add_argument("--sim-data-root", required=True,
                         help="Dataset root with train/ and manifest_train.json")
-    parser.add_argument("--n-sim",    type=int,   default=N_SIM_DEFAULT)
-    parser.add_argument("--lr",       type=float, default=LR)
+    parser.add_argument("--n-sim",        type=int,   default=N_SIM_DEFAULT)
+    parser.add_argument("--lr",           type=float, default=LR)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--grad-clip",    type=float, default=1.0)
     parser.add_argument("--epochs",   type=int,   default=MAX_EPOCHS,
                         help="Training epochs (= gradient steps since all real patients used each epoch)")
     parser.add_argument("--patience", type=int,   default=PATIENCE)
@@ -248,7 +250,8 @@ def main():
     z_real_init = patient_averaged_latents(enc, patient_tensors)
     log(f"Initial MMD: {mmd_multiscale(z_real_init, z_sim_init, median_sq).item():.4f}")
 
-    opt = torch.optim.Adam(enc.parameters(), lr=args.lr)
+    opt = torch.optim.Adam(enc.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    log(f"Optimiser: Adam lr={args.lr}  weight_decay={args.weight_decay}  grad_clip={args.grad_clip}")
 
     best_mmd  = float("inf")
     wait      = 0
@@ -268,6 +271,7 @@ def main():
         loss = mmd_multiscale(z_real, z_sim, median_sq)
         opt.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(enc.parameters(), args.grad_clip)
         opt.step()
 
         mmd_val = loss.item()
@@ -314,6 +318,8 @@ def main():
         device=DEVICE,
         training=dict(
             lr=args.lr,
+            weight_decay=args.weight_decay,
+            grad_clip=args.grad_clip,
             max_epochs=args.epochs,
             patience=args.patience,
             sim_batch=SIM_BATCH,
