@@ -69,12 +69,17 @@ class Tee:
         self._stdout.flush()
 
 
-def mmd_multiscale(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-    """Multi-scale RBF MMD, median heuristic bandwidth, 5 scales."""
+def compute_fixed_bandwidth(z_sim: torch.Tensor) -> torch.Tensor:
+    """Compute median pairwise distance from sim latents once at init.
+    Returned as a scalar tensor (median_sq). Held fixed throughout training
+    to prevent the scale-invariance runaway that occurs with per-step median heuristic.
+    """
     with torch.no_grad():
-        XY = torch.cat([X, Y], dim=0)
-        median_sq = torch.cdist(XY, XY).median().clamp(min=1e-6) ** 2
+        return torch.cdist(z_sim, z_sim).median().clamp(min=1e-6) ** 2
 
+
+def mmd_multiscale(X: torch.Tensor, Y: torch.Tensor, median_sq: torch.Tensor) -> torch.Tensor:
+    """Multi-scale RBF MMD, 5 scales around a fixed bandwidth."""
     loss = X.new_zeros(1)
     for scale in [0.25, 0.5, 1.0, 2.0, 4.0]:
         gamma = 1.0 / (2.0 * scale * median_sq)
@@ -230,11 +235,16 @@ def main():
     enc.load_state_dict(torch.load(ckpt, map_location=DEVICE))
     log(f"Loaded enc_reduced from {ckpt}")
 
-    # Log initial MMD
-    z_real_init = patient_averaged_latents(enc, patient_tensors)
+    # Compute fixed bandwidth from initial sim latents — held constant throughout training
+    # to prevent scale-invariance runaway with per-step median heuristic
     with torch.no_grad():
         z_sim_init = enc(x_sim[:1000].to(DEVICE))
-    log(f"Initial MMD: {mmd_multiscale(z_real_init, z_sim_init).item():.4f}")
+    median_sq = compute_fixed_bandwidth(z_sim_init)
+    log(f"Fixed bandwidth: median_sq={median_sq.item():.4f}")
+
+    # Log initial MMD
+    z_real_init = patient_averaged_latents(enc, patient_tensors)
+    log(f"Initial MMD: {mmd_multiscale(z_real_init, z_sim_init, median_sq).item():.4f}")
 
     opt = torch.optim.Adam(enc.parameters(), lr=args.lr)
 
@@ -253,7 +263,7 @@ def main():
         idx   = torch.randperm(len(x_sim))[:SIM_BATCH]
         z_sim = enc(x_sim[idx].to(DEVICE))
 
-        loss = mmd_multiscale(z_real, z_sim)
+        loss = mmd_multiscale(z_real, z_sim, median_sq)
         opt.zero_grad()
         loss.backward()
         opt.step()
