@@ -48,6 +48,7 @@ Examples: `exp_cnn4e64_maf5_freeze-maf`, `dry_sumstats_maf5`
 - `dry-runs/{run_name}/` — dry runs (gitignored)
 - Each run writes `run_info.json` (git hash, config, architecture) and `train_log.txt`
 - **Always commit before starting an `exp_` run** so `run_info.json` captures the exact code
+- **Always confirm the output run name/directory with the user before executing any training run** — never assume the name is correct, especially for variant runs that could overwrite existing results.
 
 ## Git conventions
 
