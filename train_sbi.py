@@ -145,9 +145,27 @@ def main():
                              "sumstats: hand-crafted")
     parser.add_argument("--freeze-epochs", type=int, default=0,
                         help="Epochs to train embedding only before joint training (0 = no freeze)")
+    parser.add_argument("--freeze-embedding", action="store_true",
+                        help="Freeze embedding net throughout — only the flow is trained. "
+                             "Use with --encoder-ckpt to train NSF on a fixed MMD-adapted encoder.")
+    parser.add_argument("--encoder-ckpt", type=str, default=None,
+                        help="Custom encoder checkpoint for ae-reduced (overrides run_dir/phase2_encoder.pt). "
+                             "e.g. path to mmd_encoder.pt from train_mmd.py")
+    parser.add_argument("--flow-model", choices=["maf", "nsf"], default="maf",
+                        help="Normalising flow architecture (default: maf)")
+    parser.add_argument("--num-transforms", type=int, default=None,
+                        help="Number of flow transforms (default: 5 for MAF, 8 for NSF)")
+    parser.add_argument("--hidden-features", type=int, default=None,
+                        help="Flow hidden features (default: 128 for MAF, 256 for NSF)")
     parser.add_argument("--n-sims", type=int, default=None,
                         help="Number of simulations to use (default: 512 for dry, 100000 for full)")
     args = parser.parse_args()
+
+    # Flow defaults: MAF→5/128, NSF→8/256
+    if args.num_transforms is None:
+        args.num_transforms = 8 if args.flow_model == "nsf" else NUM_TRANSFORMS
+    if args.hidden_features is None:
+        args.hidden_features = 256 if args.flow_model == "nsf" else HIDDEN_FEATURES
 
     run_type, run_name, run_dir = parse_run(args.run)
     is_dry          = run_type == "dry"
@@ -183,15 +201,14 @@ def main():
     log(f"Device: {DEVICE}  embedding: {args.embedding}")
 
     if use_ae_reduced:
-        ckpt = run_dir / "phase2_encoder.pt"
+        ckpt = Path(args.encoder_ckpt) if args.encoder_ckpt else run_dir / "phase2_encoder.pt"
         if not ckpt.exists():
-            raise FileNotFoundError(
-                f"{ckpt} not found. Run train_autoencoder.py --run {run_name} first."
-            )
+            raise FileNotFoundError(f"{ckpt} not found.")
         enc = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM)
         enc.load_state_dict(torch.load(ckpt, map_location="cpu"))
         embedding_net  = enc
         embedding_info = enc.describe()
+        embedding_info["ckpt"] = str(ckpt)
         z_score_x      = "none"
         dataset_cls    = ReducedCVDataset
         param_keys     = PARAM_KEYS_INFER
@@ -243,15 +260,16 @@ def main():
         ),
         embedding=embedding_info,
         flow=dict(
-            model="maf",
-            hidden_features=HIDDEN_FEATURES,
-            num_transforms=NUM_TRANSFORMS,
+            model=args.flow_model,
+            hidden_features=args.hidden_features,
+            num_transforms=args.num_transforms,
             z_score_theta="independent",
             z_score_x=z_score_x,
         ),
         training=dict(
             batch_size=BATCH_SIZE,
             freeze_epochs=args.freeze_epochs,
+            freeze_embedding=args.freeze_embedding,
         ),
     )
     (run_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
@@ -272,10 +290,10 @@ def main():
     prior = build_prior(manifest, param_keys)
 
     density_estimator_fn = posterior_nn(
-        model="maf",
+        model=args.flow_model,
         embedding_net=embedding_net,
-        hidden_features=HIDDEN_FEATURES,
-        num_transforms=NUM_TRANSFORMS,
+        hidden_features=args.hidden_features,
+        num_transforms=args.num_transforms,
         z_score_theta="independent",
         z_score_x=z_score_x,
     )
@@ -283,7 +301,16 @@ def main():
     inference = NPE(prior=prior, density_estimator=density_estimator_fn, device=DEVICE)
     inference.append_simulations(theta, x, data_device='cpu')
 
-    if args.freeze_epochs > 0:
+    if args.freeze_embedding:
+        log("Freezing embedding net — only flow parameters will be trained...")
+        inference.train(max_num_epochs=1, training_batch_size=BATCH_SIZE,
+                        show_train_summary=False)
+        for name, p in inference._neural_net.named_parameters():
+            if "embedding_net" in name:
+                p.requires_grad_(False)
+        log("Training flow only (embedding frozen, sbi early stopping)...")
+
+    elif args.freeze_epochs > 0:
         log("Initialising network (1 epoch, all params)...")
         inference.train(max_num_epochs=1, training_batch_size=BATCH_SIZE,
                         show_train_summary=False)
@@ -303,7 +330,7 @@ def main():
         log("Training NPE...")
 
     density_estimator = inference.train(
-        resume_training=args.freeze_epochs > 0,
+        resume_training=args.freeze_embedding or args.freeze_epochs > 0,
         training_batch_size=BATCH_SIZE,
         show_train_summary=True,
     )
