@@ -302,13 +302,9 @@ def main():
     inference.append_simulations(theta, x, data_device='cpu')
 
     if args.freeze_embedding:
-        log("Freezing embedding net — only flow parameters will be trained...")
-        inference.train(max_num_epochs=1, training_batch_size=BATCH_SIZE,
-                        show_train_summary=False)
-        for name, p in inference._neural_net.named_parameters():
-            if "embedding_net" in name:
-                p.requires_grad_(False)
-        log("Training flow only (embedding frozen, sbi early stopping)...")
+        for p in embedding_net.parameters():
+            p.requires_grad_(False)
+        log("Embedding frozen before training — only flow parameters will be updated...")
 
     elif args.freeze_epochs > 0:
         log("Initialising network (1 epoch, all params)...")
@@ -330,7 +326,7 @@ def main():
         log("Training NPE...")
 
     density_estimator = inference.train(
-        resume_training=args.freeze_embedding or args.freeze_epochs > 0,
+        resume_training=args.freeze_epochs > 0,
         training_batch_size=BATCH_SIZE,
         show_train_summary=True,
     )
