@@ -69,25 +69,36 @@ class Tee:
         self._stdout.flush()
 
 
-def compute_fixed_bandwidth(z_sim: torch.Tensor) -> torch.Tensor:
-    """Compute median pairwise distance from sim latents once at init.
-    Returned as a scalar tensor (median_sq). Held fixed throughout training
-    to prevent the scale-invariance runaway that occurs with per-step median heuristic.
+def compute_fixed_bandwidth(z_sim: torch.Tensor, z_real: torch.Tensor = None) -> torch.Tensor:
+    """Compute median pairwise distance from combined sim+real latents once at init.
+    Using combined sim+real ensures the base scale captures the actual cross-distribution
+    gap rather than just within-sim spacing (which was too small when real patients
+    sit at the boundary of the sim cloud).
     """
     with torch.no_grad():
-        return torch.cdist(z_sim, z_sim).median().clamp(min=1e-6) ** 2
+        z_all = torch.cat([z_sim, z_real], dim=0) if z_real is not None else z_sim
+        return torch.cdist(z_all, z_all).median().clamp(min=1e-6) ** 2
 
 
-def mmd_multiscale(X: torch.Tensor, Y: torch.Tensor, median_sq: torch.Tensor) -> torch.Tensor:
-    """Multi-scale RBF MMD, 5 scales around a fixed bandwidth."""
+def mmd_multiscale(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Multi-scale RBF MMD with per-step median heuristic bandwidth.
+    Bandwidth computed from combined X+Y each call so it adapts to the actual
+    cross-distribution gap. Stable because anchor loss prevents encoder drift.
+    8 scales [0.1-16x] for local-to-global coverage.
+    """
+    with torch.no_grad():
+        median_sq = torch.cdist(
+            torch.cat([X, Y]), torch.cat([X, Y])
+        ).median().clamp(min=1e-6) ** 2
+    scales = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
     loss = X.new_zeros(1)
-    for scale in [0.25, 0.5, 1.0, 2.0, 4.0]:
+    for scale in scales:
         gamma = 1.0 / (2.0 * scale * median_sq)
         XX = torch.exp(-gamma * torch.cdist(X, X) ** 2).mean()
         YY = torch.exp(-gamma * torch.cdist(Y, Y) ** 2).mean()
         XY = torch.exp(-gamma * torch.cdist(X, Y) ** 2).mean()
         loss = loss + (XX + YY - 2 * XY)
-    return loss / 5.0
+    return loss / len(scales)
 
 
 def load_real_patients(data_dir: Path, stats: dict, log) -> list[torch.Tensor]:
@@ -247,16 +258,11 @@ def main():
     enc_frozen.requires_grad_(False)
     enc_frozen.eval()
 
-    # Compute fixed bandwidth from initial sim latents — held constant throughout training
-    # to prevent scale-invariance runaway with per-step median heuristic
-    with torch.no_grad():
-        z_sim_init = enc(x_sim[:1000].to(DEVICE))
-    median_sq = compute_fixed_bandwidth(z_sim_init)
-    log(f"Fixed bandwidth: median_sq={median_sq.item():.4f}")
-
     # Log initial MMD
-    z_real_init = patient_averaged_latents(enc, patient_tensors)
-    log(f"Initial MMD: {mmd_multiscale(z_real_init, z_sim_init, median_sq).item():.4f}")
+    with torch.no_grad():
+        z_sim_init  = enc(x_sim[:1000].to(DEVICE))
+        z_real_init = patient_averaged_latents(enc, patient_tensors)
+    log(f"Initial MMD: {mmd_multiscale(z_real_init, z_sim_init).item():.4f}")
 
     opt = torch.optim.Adam(enc.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     log(f"Optimiser: Adam lr={args.lr}  weight_decay={args.weight_decay}  grad_clip={args.grad_clip}")
@@ -276,7 +282,7 @@ def main():
         idx   = torch.randperm(len(x_sim))[:SIM_BATCH]
         z_sim = enc(x_sim[idx].to(DEVICE))
 
-        mmd_loss = mmd_multiscale(z_real, z_sim, median_sq)
+        mmd_loss = mmd_multiscale(z_real, z_sim)
         with torch.no_grad():
             z_sim_frozen = enc_frozen(x_sim[idx].to(DEVICE))
         anchor_loss = torch.nn.functional.mse_loss(z_sim, z_sim_frozen)
