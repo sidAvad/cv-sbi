@@ -325,7 +325,7 @@ def main():
         torch.save(posterior, mmd_run_dir / "posterior.pt")
         log(f"Saved posterior to {mmd_run_dir / 'posterior.pt'}")
 
-    mmd_info = dict(
+    run_info = dict(
         run=mmd_run_name,
         base_run=args.run,
         real_data=str(args.real_data),
@@ -348,8 +348,9 @@ def main():
             kernel_scales=[0.25, 0.5, 1.0, 2.0, 4.0],
         ),
     )
-    (mmd_run_dir / "mmd_info.json").write_text(json.dumps(mmd_info, indent=2))
-    log("Saved mmd_info.json")
+    info_path = mmd_run_dir / f"run_info_{date_str}.json"
+    info_path.write_text(json.dumps(run_info, indent=2))
+    log(f"Saved {info_path.name}")
 
     log_fh.close()
     sys.stdout = _stdout

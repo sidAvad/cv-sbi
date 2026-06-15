@@ -290,8 +290,8 @@ def main():
             break
 
     enc.load_state_dict(best_state)
-    torch.save(enc.state_dict(), ot_run_dir / "mmd_encoder.pt")
-    log("Saved mmd_encoder.pt (best checkpoint)")
+    torch.save(enc.state_dict(), ot_run_dir / "encoder.pt")
+    log("Saved encoder.pt (best checkpoint)")
 
     if args.dry_run:
         log("Dry run — posterior not saved.")
@@ -304,7 +304,7 @@ def main():
         torch.save(posterior, ot_run_dir / "posterior.pt")
         log(f"Saved posterior to {ot_run_dir / 'posterior.pt'}")
 
-    ot_info = dict(
+    run_info = dict(
         run=args.output_run,
         base_run=args.run,
         warm_start=str(args.warm_start) if args.warm_start else None,
@@ -328,8 +328,9 @@ def main():
             best_sinkhorn=best_loss,
         ),
     )
-    (ot_run_dir / "ot_info.json").write_text(json.dumps(ot_info, indent=2))
-    log("Saved ot_info.json")
+    info_path = ot_run_dir / f"run_info_{date_str}.json"
+    info_path.write_text(json.dumps(run_info, indent=2))
+    log(f"Saved {info_path.name}")
 
     log_fh.close()
     sys.stdout = _stdout
