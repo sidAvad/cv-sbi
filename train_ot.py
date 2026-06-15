@@ -256,7 +256,10 @@ def main():
     for epoch in range(1, args.epochs + 1):
         enc.train()
 
-        z_real = patient_averaged_latents(enc, patient_tensors)
+        # Encode real patients with gradients (patient_averaged_latents uses no_grad)
+        enc.train()
+        z_real_list = [enc(beats.to(DEVICE)).mean(dim=0) for beats in patient_tensors]
+        z_real = torch.stack(z_real_list)  # (n_patients, latent_dim) — grad enabled
 
         idx = torch.randperm(len(x_sim))[:SIM_BATCH]
         with torch.no_grad():
