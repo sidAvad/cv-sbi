@@ -250,6 +250,7 @@ def main():
         run=run_name,
         type=run_type,
         timestamp=datetime.now().isoformat(timespec="seconds"),
+        command=" ".join(sys.argv),
         script=str(Path(sys.argv[0]).resolve()),
         git_hash=git_hash(),
         device=DEVICE,
