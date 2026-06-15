@@ -168,9 +168,7 @@ def main():
     parser.add_argument("--lr",            type=float, default=LR)
     parser.add_argument("--weight-decay",  type=float, default=1e-4)
     parser.add_argument("--grad-clip",     type=float, default=1.0)
-    parser.add_argument("--anchor-weight", type=float, default=0.1,
-                        help="Weight for sim anchor loss: λ * ||enc(x_sim) - enc_frozen(x_sim)||²")
-    parser.add_argument("--blur",          type=float, default=0.05,
+    parser.add_argument("--blur",          type=float, default=0.5,
                         help="Sinkhorn blur (entropic regularisation ε). "
                              "Smaller = sharper transport plan, less smoothing.")
     parser.add_argument("--epochs",        type=int,   default=MAX_EPOCHS)
@@ -201,7 +199,7 @@ def main():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
     log(f"OT fine-tuning: {args.run} → {args.output_run}  ({'DRY RUN' if args.dry_run else 'full'})")
-    log(f"Device: {DEVICE}  lr: {args.lr}  blur: {args.blur}  anchor_weight: {args.anchor_weight}")
+    log(f"Device: {DEVICE}  lr: {args.lr}  blur: {args.blur}  (fixed sim target — no anchor loss)")
     log(f"warm-start: {args.warm_start or 'phase2_encoder.pt'}")
 
     stats    = load_stats(STATS_PATH)
@@ -229,20 +227,21 @@ def main():
     enc = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
     enc.load_state_dict(torch.load(ckpt, map_location=DEVICE))
 
-    # Frozen reference encoder — anchors sim latents to their original positions
-    anchor_ckpt = base_run_dir / "phase2_encoder.pt"
-    enc_frozen  = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
-    enc_frozen.load_state_dict(torch.load(anchor_ckpt, map_location=DEVICE))
+    # Frozen sim encoder — defines the fixed target distribution (always phase2)
+    # Sim latents never move; only real latents are transported toward them.
+    sim_ckpt   = base_run_dir / "phase2_encoder.pt"
+    enc_frozen = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
+    enc_frozen.load_state_dict(torch.load(sim_ckpt, map_location=DEVICE))
     enc_frozen.requires_grad_(False)
     enc_frozen.eval()
-    log(f"Anchor encoder fixed to {anchor_ckpt}")
+    log(f"Sim target encoder fixed to {sim_ckpt}")
 
     sinkhorn = SamplesLoss("sinkhorn", p=2, blur=args.blur, backend="tensorized")
     log(f"Sinkhorn loss: p=2  blur={args.blur}  backend=tensorized")
 
     # Log initial Sinkhorn divergence
     with torch.no_grad():
-        z_sim_init  = enc(x_sim[:1000].to(DEVICE))
+        z_sim_init  = enc_frozen(x_sim[:1000].to(DEVICE))
         z_real_init = patient_averaged_latents(enc, patient_tensors)
     log(f"Initial Sinkhorn: {sinkhorn(z_real_init, z_sim_init).item():.4f}")
 
@@ -259,21 +258,18 @@ def main():
 
         z_real = patient_averaged_latents(enc, patient_tensors)
 
-        idx   = torch.randperm(len(x_sim))[:SIM_BATCH]
-        z_sim = enc(x_sim[idx].to(DEVICE))
-
-        ot_loss = sinkhorn(z_real, z_sim)
+        idx = torch.randperm(len(x_sim))[:SIM_BATCH]
         with torch.no_grad():
-            z_sim_frozen = enc_frozen(x_sim[idx].to(DEVICE))
-        anchor_loss = torch.nn.functional.mse_loss(z_sim, z_sim_frozen)
-        loss = ot_loss + args.anchor_weight * anchor_loss
+            z_sim = enc_frozen(x_sim[idx].to(DEVICE))   # fixed target, no grad
+
+        loss = sinkhorn(z_real, z_sim)
 
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(enc.parameters(), args.grad_clip)
         opt.step()
 
-        ot_val = ot_loss.item()
+        ot_val = loss.item()
 
         if ot_val < best_loss:
             best_loss  = ot_val
@@ -283,7 +279,7 @@ def main():
             wait += 1
 
         if epoch % LOG_EVERY == 0 or epoch == 1:
-            log(f"  epoch {epoch:4d}/{args.epochs}  sinkhorn={ot_val:.4f}  anchor={anchor_loss.item():.4f}  best={best_loss:.4f}  wait={wait}")
+            log(f"  epoch {epoch:4d}/{args.epochs}  sinkhorn={ot_val:.4f}  best={best_loss:.4f}  wait={wait}")
 
         if wait >= args.patience:
             log(f"  early stop at epoch {epoch}  best_sinkhorn={best_loss:.4f}")
@@ -319,7 +315,6 @@ def main():
             lr=args.lr,
             weight_decay=args.weight_decay,
             grad_clip=args.grad_clip,
-            anchor_weight=args.anchor_weight,
             blur=args.blur,
             max_epochs=args.epochs,
             patience=args.patience,
