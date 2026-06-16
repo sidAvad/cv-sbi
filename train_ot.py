@@ -301,19 +301,20 @@ def main():
             break
 
     enc.load_state_dict(best_state)
-    torch.save(enc.state_dict(), ot_run_dir / "encoder.pt")
-    log("Saved encoder.pt (best checkpoint)")
+    # Save as real_encoder.pt — this encoder is for real patients only.
+    # Sims are encoded by the frozen sim encoder (enc_frozen / --sim-encoder-ckpt).
+    # At inference: z_real = real_encoder(x_real), z_sim = base posterior's embedding_net(x_sim).
+    # NN search compares z_real to z_sim; posterior conditions on x_nn via the base embedding_net.
+    torch.save(enc.state_dict(), ot_run_dir / "real_encoder.pt")
+    log("Saved real_encoder.pt — transport map for real patients (NOT for sims)")
 
     if args.dry_run:
-        log("Dry run — posterior not saved.")
+        log("Dry run — posterior not copied.")
     else:
-        log("Updating posterior with fine-tuned encoder...")
-        posterior = torch.load(
-            base_run_dir / "posterior.pt", map_location=DEVICE, weights_only=False
-        )
-        posterior.posterior_estimator.embedding_net.load_state_dict(enc.state_dict())
-        torch.save(posterior, ot_run_dir / "posterior.pt")
-        log(f"Saved posterior to {ot_run_dir / 'posterior.pt'}")
+        import shutil
+        shutil.copy(base_run_dir / "posterior.pt", ot_run_dir / "posterior.pt")
+        log(f"Copied base run posterior unchanged → {ot_run_dir / 'posterior.pt'}")
+        log("Posterior embedding_net is the original base encoder (enc_maf_joint), not real_encoder")
 
     run_info = dict(
         run=args.output_run,
