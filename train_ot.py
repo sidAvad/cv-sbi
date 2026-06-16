@@ -6,10 +6,9 @@ plan between real and sim latents, giving a per-sample gradient signal rather
 than an aggregate distributional statistic. More informative than MMD when
 n_real is small (60 patients).
 
-Sim anchor loss unchanged: λ * ||enc(x_sim) - enc_frozen(x_sim)||²
-
-Can warm-start from an existing mmd_encoder.pt (--warm-start) rather than
-phase2_encoder.pt — recommended when starting from the adaptive MMD checkpoint.
+The frozen sim target defaults to phase2_encoder.pt from --run, but can be
+overridden with --sim-encoder-ckpt to target a jointly-trained encoder (e.g.
+extracted from posterior.pt via extract_encoder.py).
 
 Usage:
     python train_ot.py
@@ -17,7 +16,8 @@ Usage:
         --real-data ~/real_data/multibeat
         --output-run exp_cnn4e64-ae-reduced_maf5_freeze-maf_1M_ot-sinkhorn
         --sim-data-root /media/local/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314
-        [--warm-start outputs/exp_.../mmd_encoder.pt]
+        [--warm-start outputs/exp_.../encoder.pt]
+        [--sim-encoder-ckpt outputs/exp_.../enc_maf_joint.pt]
 """
 
 import argparse
@@ -162,8 +162,13 @@ def main():
                         help="Output run name")
     parser.add_argument("--sim-data-root", required=True)
     parser.add_argument("--warm-start",    default=None,
-                        help="Path to an existing mmd_encoder.pt to warm-start from "
-                             "(e.g. outputs/.../mmd_encoder.pt). Default: use phase2_encoder.pt")
+                        help="Path to an encoder checkpoint to warm-start from. "
+                             "Default: phase2_encoder.pt from --run.")
+    parser.add_argument("--sim-encoder-ckpt", default=None,
+                        help="Path to encoder checkpoint defining the frozen sim target distribution. "
+                             "Default: phase2_encoder.pt from --run. Override with a jointly-trained "
+                             "encoder (e.g. enc_maf_joint.pt extracted from posterior.pt) to OT into "
+                             "the NPE-shaped latent space.")
     parser.add_argument("--n-sim",         type=int,   default=N_SIM_DEFAULT)
     parser.add_argument("--lr",            type=float, default=LR)
     parser.add_argument("--weight-decay",  type=float, default=1e-4)
@@ -200,7 +205,8 @@ def main():
 
     log(f"OT fine-tuning: {args.run} → {args.output_run}  ({'DRY RUN' if args.dry_run else 'full'})")
     log(f"Device: {DEVICE}  lr: {args.lr}  blur: {args.blur}  (fixed sim target — no anchor loss)")
-    log(f"warm-start: {args.warm_start or 'phase2_encoder.pt'}")
+    log(f"warm-start: {args.warm_start or 'phase2_encoder.pt (default)'}")
+    log(f"sim-encoder-ckpt: {args.sim_encoder_ckpt or 'phase2_encoder.pt (default)'}")
 
     stats    = load_stats(STATS_PATH)
     manifest = load_manifest(Path(args.sim_data_root) / "manifest_train.json")
@@ -227,9 +233,15 @@ def main():
     enc = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
     enc.load_state_dict(torch.load(ckpt, map_location=DEVICE))
 
-    # Frozen sim encoder — defines the fixed target distribution (always phase2)
-    # Sim latents never move; only real latents are transported toward them.
-    sim_ckpt   = base_run_dir / "phase2_encoder.pt"
+    # Frozen sim encoder — defines the fixed target distribution.
+    # Defaults to phase2_encoder.pt; override with --sim-encoder-ckpt to target
+    # a jointly-trained (NPE-shaped) latent space.
+    sim_ckpt = (
+        Path(args.sim_encoder_ckpt) if args.sim_encoder_ckpt
+        else base_run_dir / "phase2_encoder.pt"
+    )
+    if not sim_ckpt.exists():
+        raise FileNotFoundError(f"--sim-encoder-ckpt not found: {sim_ckpt}")
     enc_frozen = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
     enc_frozen.load_state_dict(torch.load(sim_ckpt, map_location=DEVICE))
     enc_frozen.requires_grad_(False)
@@ -307,6 +319,7 @@ def main():
         run=args.output_run,
         base_run=args.run,
         warm_start=str(args.warm_start) if args.warm_start else None,
+        sim_encoder_ckpt=str(sim_ckpt),
         real_data=str(args.real_data),
         real_data_name=real_data_name,
         n_patients=len(patient_tensors),
