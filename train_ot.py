@@ -179,7 +179,7 @@ def main():
     parser.add_argument("--blur",          type=float, default=0.5,
                         help="Sinkhorn blur (entropic regularisation ε). "
                              "Smaller = sharper transport plan, less smoothing.")
-    parser.add_argument("--beta-ll",       type=float, default=0.01,
+    parser.add_argument("--beta-ll",       type=float, default=0.0001,
                         help="Weight for flow log-likelihood term. "
                              "L = L_OT - beta_ll * E[log p_flow(theta|z_real)]. "
                              "Flow is frozen; gradient flows through z_real → enc_real. "
@@ -331,12 +331,7 @@ def main():
             # normalization needed. Gradient flows through z_real → enc; flow_net is frozen.
             noise, logabsdet = flow_net._transform(theta_samples, context=z_real)
             ll = flow_net._distribution.log_prob(noise, context=z_real) + logabsdet
-            # Clamp per-patient LL to [-500, ∞). nan_to_num handles ±inf;
-            # clamp handles finite-but-huge negative values when patients are very OOD.
-            # At ll=-100k, unclamped contribution (beta * 100k) would swamp OT entirely.
-            # The -500 floor means OT dominates early while still carrying LL gradient
-            # for patients near the support boundary.
-            ll = torch.clamp(ll.nan_to_num(nan=0.0), min=-500.0)
+            ll = ll.nan_to_num(nan=0.0, posinf=0.0)  # only guard NaN and +inf
             ll_val = ll.mean().item()
             loss = ot_loss - args.beta_ll * ll.mean()
         else:
