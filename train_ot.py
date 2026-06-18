@@ -170,7 +170,7 @@ def main():
                              "encoder (e.g. enc_maf_joint.pt extracted from posterior.pt) to OT into "
                              "the NPE-shaped latent space.")
     parser.add_argument("--n-sim",         type=int,   default=N_SIM_DEFAULT)
-    parser.add_argument("--sim-batch",     type=int,   default=50_000,
+    parser.add_argument("--sim-batch",     type=int,   default=512,
                         help="Sim latents sampled per epoch from z_sim_all. "
                              "Precomputes all --n-sim latents once, subsamples each epoch.")
     parser.add_argument("--lr",            type=float, default=LR)
