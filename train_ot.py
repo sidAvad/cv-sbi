@@ -217,15 +217,6 @@ def main():
         Path(args.sim_data_root) / "train", manifest, stats, args.n_sim, log
     )
 
-    log("Pre-computing sim latents (enc_frozen, all sims)...")
-    z_sim_chunks = []
-    with torch.no_grad():
-        for i in range(0, len(x_sim), 512):
-            z_sim_chunks.append(enc_frozen(x_sim[i:i+512].to(DEVICE)))
-    z_sim_all = torch.cat(z_sim_chunks)  # (n_sim, latent_dim) on GPU
-    del x_sim, z_sim_chunks
-    log(f"z_sim_all: {tuple(z_sim_all.shape)}  GPU mem allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-
     # Load encoder — warm-start from existing checkpoint or cold-start from phase2
     if args.warm_start:
         ckpt = Path(args.warm_start)
@@ -255,6 +246,15 @@ def main():
     enc_frozen.requires_grad_(False)
     enc_frozen.eval()
     log(f"Sim target encoder fixed to {sim_ckpt}")
+
+    log("Pre-computing sim latents (enc_frozen, all sims)...")
+    z_sim_chunks = []
+    with torch.no_grad():
+        for i in range(0, len(x_sim), 512):
+            z_sim_chunks.append(enc_frozen(x_sim[i:i+512].to(DEVICE)))
+    z_sim_all = torch.cat(z_sim_chunks)  # (n_sim, latent_dim) on GPU
+    del x_sim, z_sim_chunks
+    log(f"z_sim_all: {tuple(z_sim_all.shape)}  GPU mem allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
     sinkhorn = SamplesLoss("sinkhorn", p=2, blur=args.blur, backend="tensorized")
     log(f"Sinkhorn loss: p=2  blur={args.blur}  backend=tensorized")
