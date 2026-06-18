@@ -37,7 +37,7 @@ from torch.utils.data import DataLoader
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-from dataset import ReducedCVDataset, load_stats, load_manifest
+from dataset import ReducedCVDataset, load_stats, load_manifest, PARAM_KEYS_INFER
 from models import ReducedAutoencoderEncoder, LATENT_DIM
 
 
@@ -179,6 +179,11 @@ def main():
     parser.add_argument("--blur",          type=float, default=0.5,
                         help="Sinkhorn blur (entropic regularisation ε). "
                              "Smaller = sharper transport plan, less smoothing.")
+    parser.add_argument("--beta-ll",       type=float, default=0.01,
+                        help="Weight for flow log-likelihood term. "
+                             "L = L_OT - beta_ll * E[log p_flow(theta|z_real)]. "
+                             "Flow is frozen; gradient flows through z_real → enc_real. "
+                             "Set 0 for OT-only training.")
     parser.add_argument("--epochs",        type=int,   default=MAX_EPOCHS)
     parser.add_argument("--patience",      type=int,   default=PATIENCE)
     parser.add_argument("--dry-run",       action="store_true",
@@ -261,6 +266,27 @@ def main():
     del x_sim, z_sim_chunks
     log(f"z_sim_all: {tuple(z_sim_all.shape)}  GPU mem allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
+    # Flow log-likelihood term: p_flow(theta | z_real) — flow is frozen, gradient flows through z_real
+    if args.beta_ll > 0:
+        post = torch.load(base_run_dir / "posterior.pt", map_location=DEVICE, weights_only=False)
+        flow_net = post.posterior_estimator.net  # raw nflows flow — takes (theta, context=z) directly
+        flow_net.eval()
+        flow_net.requires_grad_(False)
+        lo_t = torch.tensor(
+            [manifest["config"]["pvar_low"][k]  for k in PARAM_KEYS_INFER],
+            dtype=torch.float32, device=DEVICE
+        )
+        hi_t = torch.tensor(
+            [manifest["config"]["pvar_high"][k] for k in PARAM_KEYS_INFER],
+            dtype=torch.float32, device=DEVICE
+        )
+        del post
+        log(f"Flow LL enabled: beta_ll={args.beta_ll}  |theta|={len(PARAM_KEYS_INFER)}  "
+            f"flow from {base_run_dir / 'posterior.pt'}")
+    else:
+        flow_net = None
+        log("Flow LL disabled (beta_ll=0)")
+
     sinkhorn = SamplesLoss("sinkhorn", p=2, blur=args.blur, backend="tensorized")
     log(f"Sinkhorn loss: p=2  blur={args.blur}  backend=tensorized")
 
@@ -279,7 +305,7 @@ def main():
     csv_path = ot_run_dir / f"train_log_{date_str}.csv"
     csv_fh   = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_fh)
-    csv_writer.writerow(["epoch", "sinkhorn"])
+    csv_writer.writerow(["epoch", "ot_loss", "ll_mean", "total_loss"])
 
     log("Training...")
     for epoch in range(1, args.epochs + 1):
@@ -290,30 +316,54 @@ def main():
         z_real_list = [enc(beats.to(DEVICE)).mean(dim=0) for beats in patient_tensors]
         z_real = torch.stack(z_real_list)  # (n_patients, latent_dim) — grad enabled
 
-        idx  = torch.randperm(len(z_sim_all), device=DEVICE)[:args.sim_batch]
-        loss = sinkhorn(z_real, z_sim_all[idx])
+        idx     = torch.randperm(len(z_sim_all), device=DEVICE)[:args.sim_batch]
+        ot_loss = sinkhorn(z_real, z_sim_all[idx])
+
+        if flow_net is not None:
+            # Sample 1 theta per patient from uniform prior (no grad needed for theta)
+            with torch.no_grad():
+                u = torch.rand(len(patient_tensors), len(lo_t), device=DEVICE)
+                theta_samples = lo_t + u * (hi_t - lo_t)
+            # Bypass flow._embedding_net (enc_maf_joint): z_real IS already the embedded
+            # context. Calling flow_net.log_prob would re-encode z_real through enc_maf_joint.
+            # Instead use _transform + _distribution directly (matches flow._log_prob internals).
+            # Theta standardization is the first transform in flow._transform — no manual
+            # normalization needed. Gradient flows through z_real → enc; flow_net is frozen.
+            noise, logabsdet = flow_net._transform(theta_samples, context=z_real)
+            ll = flow_net._distribution.log_prob(noise, context=z_real) + logabsdet
+            ll = ll.nan_to_num(nan=0.0, posinf=0.0, neginf=-500.0)
+            ll_val = ll.mean().item()
+            loss = ot_loss - args.beta_ll * ll.mean()
+        else:
+            ll_val = 0.0
+            loss = ot_loss
 
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(enc.parameters(), args.grad_clip)
         opt.step()
 
-        ot_val = loss.item()
-        csv_writer.writerow([epoch, f"{ot_val:.6f}"])
+        ot_val    = ot_loss.item()
+        total_val = loss.item()
+        csv_writer.writerow([epoch, f"{ot_val:.6f}", f"{ll_val:.4f}", f"{total_val:.6f}"])
         csv_fh.flush()
 
-        if ot_val < best_loss:
-            best_loss  = ot_val
+        if total_val < best_loss:
+            best_loss  = total_val
             wait       = 0
             best_state = {k: v.clone() for k, v in enc.state_dict().items()}
         else:
             wait += 1
 
         if epoch % LOG_EVERY == 0 or epoch == 1:
-            log(f"  epoch {epoch:4d}/{args.epochs}  sinkhorn={ot_val:.4f}  best={best_loss:.4f}  wait={wait}")
+            if flow_net is not None:
+                log(f"  epoch {epoch:4d}/{args.epochs}  ot={ot_val:.4f}  ll={ll_val:.2f}  "
+                    f"total={total_val:.4f}  best={best_loss:.4f}  wait={wait}")
+            else:
+                log(f"  epoch {epoch:4d}/{args.epochs}  ot={ot_val:.4f}  best={best_loss:.4f}  wait={wait}")
 
         if wait >= args.patience:
-            log(f"  early stop at epoch {epoch}  best_sinkhorn={best_loss:.4f}")
+            log(f"  early stop at epoch {epoch}  best_total={best_loss:.4f}")
             break
 
     csv_fh.close()
@@ -353,13 +403,14 @@ def main():
             weight_decay=args.weight_decay,
             grad_clip=args.grad_clip,
             blur=args.blur,
+            beta_ll=args.beta_ll,
             max_epochs=args.epochs,
             patience=args.patience,
             n_sim=args.n_sim,
             sim_target="all_precomputed",
             n_sim_target=len(z_sim_all),
             sim_batch=args.sim_batch,
-            best_sinkhorn=best_loss,
+            best_total_loss=best_loss,
         ),
     )
     info_path = ot_run_dir / f"run_info_{date_str}.json"
