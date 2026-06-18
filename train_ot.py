@@ -331,7 +331,12 @@ def main():
             # normalization needed. Gradient flows through z_real → enc; flow_net is frozen.
             noise, logabsdet = flow_net._transform(theta_samples, context=z_real)
             ll = flow_net._distribution.log_prob(noise, context=z_real) + logabsdet
-            ll = ll.nan_to_num(nan=0.0, posinf=0.0, neginf=-500.0)
+            # Clamp per-patient LL to [-500, ∞). nan_to_num handles ±inf;
+            # clamp handles finite-but-huge negative values when patients are very OOD.
+            # At ll=-100k, unclamped contribution (beta * 100k) would swamp OT entirely.
+            # The -500 floor means OT dominates early while still carrying LL gradient
+            # for patients near the support boundary.
+            ll = torch.clamp(ll.nan_to_num(nan=0.0), min=-500.0)
             ll_val = ll.mean().item()
             loss = ot_loss - args.beta_ll * ll.mean()
         else:
