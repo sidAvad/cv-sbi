@@ -27,6 +27,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import csv
 import h5py
 import numpy as np
 import torch
@@ -271,6 +272,11 @@ def main():
     wait       = 0
     best_state = {k: v.clone() for k, v in enc.state_dict().items()}
 
+    csv_path = ot_run_dir / f"train_log_{date_str}.csv"
+    csv_fh   = open(csv_path, "w", newline="")
+    csv_writer = csv.writer(csv_fh)
+    csv_writer.writerow(["epoch", "sinkhorn"])
+
     log("Training...")
     for epoch in range(1, args.epochs + 1):
         enc.train()
@@ -288,6 +294,8 @@ def main():
         opt.step()
 
         ot_val = loss.item()
+        csv_writer.writerow([epoch, f"{ot_val:.6f}"])
+        csv_fh.flush()
 
         if ot_val < best_loss:
             best_loss  = ot_val
@@ -302,6 +310,9 @@ def main():
         if wait >= args.patience:
             log(f"  early stop at epoch {epoch}  best_sinkhorn={best_loss:.4f}")
             break
+
+    csv_fh.close()
+    log(f"Saved {csv_path.name}")
 
     enc.load_state_dict(best_state)
     # Save as real_encoder.pt — this encoder is for real patients only.
