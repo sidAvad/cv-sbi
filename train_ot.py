@@ -170,6 +170,9 @@ def main():
                              "encoder (e.g. enc_maf_joint.pt extracted from posterior.pt) to OT into "
                              "the NPE-shaped latent space.")
     parser.add_argument("--n-sim",         type=int,   default=N_SIM_DEFAULT)
+    parser.add_argument("--sim-batch",     type=int,   default=50_000,
+                        help="Sim latents sampled per epoch from z_sim_all. "
+                             "Precomputes all --n-sim latents once, subsamples each epoch.")
     parser.add_argument("--lr",            type=float, default=LR)
     parser.add_argument("--weight-decay",  type=float, default=1e-4)
     parser.add_argument("--grad-clip",     type=float, default=1.0)
@@ -185,6 +188,7 @@ def main():
     if args.dry_run:
         args.epochs   = 2
         args.n_sim    = 512
+        args.sim_batch = 512
         args.patience = 999
 
     real_data_name = Path(args.real_data).name
@@ -286,7 +290,8 @@ def main():
         z_real_list = [enc(beats.to(DEVICE)).mean(dim=0) for beats in patient_tensors]
         z_real = torch.stack(z_real_list)  # (n_patients, latent_dim) — grad enabled
 
-        loss = sinkhorn(z_real, z_sim_all)
+        idx  = torch.randperm(len(z_sim_all), device=DEVICE)[:args.sim_batch]
+        loss = sinkhorn(z_real, z_sim_all[idx])
 
         opt.zero_grad()
         loss.backward()
@@ -353,6 +358,7 @@ def main():
             n_sim=args.n_sim,
             sim_target="all_precomputed",
             n_sim_target=len(z_sim_all),
+            sim_batch=args.sim_batch,
             best_sinkhorn=best_loss,
         ),
     )
