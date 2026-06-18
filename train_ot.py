@@ -42,7 +42,6 @@ from models import ReducedAutoencoderEncoder, LATENT_DIM
 
 STATS_PATH     = Path("norm_stats.json")
 WAVE_KEYS_REAL = ["Prv", "Pra", "Pvp", "Pap"]
-SIM_BATCH      = 256
 LR             = 1e-4
 MAX_EPOCHS     = 500
 PATIENCE       = 50
@@ -218,6 +217,15 @@ def main():
         Path(args.sim_data_root) / "train", manifest, stats, args.n_sim, log
     )
 
+    log("Pre-computing sim latents (enc_frozen, all sims)...")
+    z_sim_chunks = []
+    with torch.no_grad():
+        for i in range(0, len(x_sim), 512):
+            z_sim_chunks.append(enc_frozen(x_sim[i:i+512].to(DEVICE)))
+    z_sim_all = torch.cat(z_sim_chunks)  # (n_sim, latent_dim) on GPU
+    del x_sim, z_sim_chunks
+    log(f"z_sim_all: {tuple(z_sim_all.shape)}  GPU mem allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
     # Load encoder — warm-start from existing checkpoint or cold-start from phase2
     if args.warm_start:
         ckpt = Path(args.warm_start)
@@ -251,11 +259,10 @@ def main():
     sinkhorn = SamplesLoss("sinkhorn", p=2, blur=args.blur, backend="tensorized")
     log(f"Sinkhorn loss: p=2  blur={args.blur}  backend=tensorized")
 
-    # Log initial Sinkhorn divergence
+    # Log initial Sinkhorn divergence (uses z_sim_all — consistent with training)
     with torch.no_grad():
-        z_sim_init  = enc_frozen(x_sim[:1000].to(DEVICE))
         z_real_init = patient_averaged_latents(enc, patient_tensors)
-    log(f"Initial Sinkhorn: {sinkhorn(z_real_init, z_sim_init).item():.4f}")
+    log(f"Initial Sinkhorn: {sinkhorn(z_real_init, z_sim_all).item():.4f}")
 
     opt = torch.optim.Adam(enc.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     log(f"Optimiser: Adam lr={args.lr}  weight_decay={args.weight_decay}  grad_clip={args.grad_clip}")
@@ -273,11 +280,7 @@ def main():
         z_real_list = [enc(beats.to(DEVICE)).mean(dim=0) for beats in patient_tensors]
         z_real = torch.stack(z_real_list)  # (n_patients, latent_dim) — grad enabled
 
-        idx = torch.randperm(len(x_sim))[:SIM_BATCH]
-        with torch.no_grad():
-            z_sim = enc_frozen(x_sim[idx].to(DEVICE))   # fixed target, no grad
-
-        loss = sinkhorn(z_real, z_sim)
+        loss = sinkhorn(z_real, z_sim_all)
 
         opt.zero_grad()
         loss.backward()
@@ -318,6 +321,7 @@ def main():
 
     run_info = dict(
         run=args.output_run,
+        command=" ".join(sys.argv),
         base_run=args.run,
         warm_start=str(args.warm_start) if args.warm_start else None,
         sim_encoder_ckpt=str(sim_ckpt),
@@ -335,8 +339,9 @@ def main():
             blur=args.blur,
             max_epochs=args.epochs,
             patience=args.patience,
-            sim_batch=SIM_BATCH,
             n_sim=args.n_sim,
+            sim_target="all_precomputed",
+            n_sim_target=len(z_sim_all),
             best_sinkhorn=best_loss,
         ),
     )
