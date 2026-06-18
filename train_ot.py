@@ -261,8 +261,8 @@ def main():
     del x_sim, z_sim_chunks
     log(f"z_sim_all: {tuple(z_sim_all.shape)}  GPU mem allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    sinkhorn = SamplesLoss("sinkhorn", p=2, blur=args.blur, backend="online")
-    log(f"Sinkhorn loss: p=2  blur={args.blur}  backend=online (KeOps)")
+    sinkhorn = SamplesLoss("sinkhorn", p=2, blur=args.blur, backend="tensorized")
+    log(f"Sinkhorn loss: p=2  blur={args.blur}  backend=tensorized")
 
     # Log initial Sinkhorn divergence (uses z_sim_all — consistent with training)
     with torch.no_grad():
