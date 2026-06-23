@@ -37,7 +37,7 @@ from dataset import (
 )
 from models import (
     WaveformEmbedding, ReducedWaveformEmbedding, TransformerWaveformEmbedding,
-    ReducedAutoencoderEncoder,
+    ReducedAutoencoderEncoder, LipschitzReducedAutoencoderEncoder,
     EMBED_DIM, LATENT_DIM,
 )
 
@@ -136,12 +136,13 @@ def main():
                         help="Dataset root containing train/ and manifest_train.json")
     parser.add_argument("--embedding",
                         choices=["cnn", "cnn-meanpool", "sumstats", "cnn-reduced",
-                                 "transformer-reduced", "ae-reduced"],
+                                 "transformer-reduced", "ae-reduced", "ae-reduced-lipschitz"],
                         default="cnn",
                         help="cnn: full 28-ch CNN attn pool; cnn-meanpool: full 28-ch CNN mean pool; "
                              "cnn-reduced: 4-ch CNN + scalar prefix tokens; "
                              "transformer-reduced: transformer encoder on 4-ch + scalars; "
                              "ae-reduced: load phase2_encoder.pt (ReducedAutoencoderEncoder, 128-dim); "
+                             "ae-reduced-lipschitz: same with soft spectral-norm ceiling (LipschitzReducedAutoencoderEncoder); "
                              "sumstats: hand-crafted")
     parser.add_argument("--freeze-epochs", type=int, default=0,
                         help="Epochs to train embedding only before joint training (0 = no freeze)")
@@ -151,6 +152,8 @@ def main():
     parser.add_argument("--encoder-ckpt", type=str, default=None,
                         help="Custom encoder checkpoint for ae-reduced (overrides run_dir/phase2_encoder.pt). "
                              "e.g. path to mmd_encoder.pt from train_mmd.py")
+    parser.add_argument("--sn-ceiling", type=float, default=2.0,
+                        help="Soft spectral-norm ceiling for ae-reduced-lipschitz (default: 2.0)")
     parser.add_argument("--flow-model", choices=["maf", "nsf"], default="maf",
                         help="Normalising flow architecture (default: maf)")
     parser.add_argument("--num-transforms", type=int, default=None,
@@ -169,11 +172,12 @@ def main():
 
     run_type, run_name, run_dir = parse_run(args.run)
     is_dry          = run_type == "dry"
-    use_reduced     = args.embedding == "cnn-reduced"
-    use_transformer = args.embedding == "transformer-reduced"
-    use_ae_reduced  = args.embedding == "ae-reduced"
-    use_sumstats    = args.embedding == "sumstats"
-    use_meanpool    = args.embedding == "cnn-meanpool"
+    use_reduced              = args.embedding == "cnn-reduced"
+    use_transformer          = args.embedding == "transformer-reduced"
+    use_ae_reduced           = args.embedding in ("ae-reduced", "ae-reduced-lipschitz")
+    use_ae_reduced_lipschitz = args.embedding == "ae-reduced-lipschitz"
+    use_sumstats             = args.embedding == "sumstats"
+    use_meanpool             = args.embedding == "cnn-meanpool"
     data_root   = Path(args.data_root)
     data_dir    = data_root / "train"
     manifest_path = data_root / "manifest_train.json"
@@ -204,7 +208,10 @@ def main():
         ckpt = Path(args.encoder_ckpt) if args.encoder_ckpt else run_dir / "phase2_encoder.pt"
         if not ckpt.exists():
             raise FileNotFoundError(f"{ckpt} not found.")
-        enc = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM)
+        if use_ae_reduced_lipschitz:
+            enc = LipschitzReducedAutoencoderEncoder(latent_dim=LATENT_DIM, sn_ceiling=args.sn_ceiling)
+        else:
+            enc = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM)
         enc.load_state_dict(torch.load(ckpt, map_location="cpu"))
         embedding_net  = enc
         embedding_info = enc.describe()

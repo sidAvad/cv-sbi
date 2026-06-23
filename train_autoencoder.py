@@ -36,7 +36,10 @@ from dataset import (
     CVDataset, PairedCVDataset,
     load_stats, load_manifest,
 )
-from models import AutoencoderEncoder, ReducedAutoencoderEncoder, WaveformDecoder, LATENT_DIM
+from models import (
+    AutoencoderEncoder, ReducedAutoencoderEncoder, LipschitzReducedAutoencoderEncoder,
+    WaveformDecoder, LATENT_DIM,
+)
 
 
 STATS_PATH        = Path("norm_stats.json")
@@ -132,6 +135,10 @@ def main():
                         help="Dataset root containing train/ and manifest_train.json")
     parser.add_argument("--n-sims", type=int, default=None,
                         help="Number of simulations (dry runs always 512; full runs default 100k)")
+    parser.add_argument("--lipschitz", action="store_true",
+                        help="Use LipschitzReducedAutoencoderEncoder in phase 2 (soft spectral-norm ceiling)")
+    parser.add_argument("--sn-ceiling", type=float, default=2.0,
+                        help="Soft spectral-norm ceiling per layer (default: 2.0, only with --lipschitz)")
     args = parser.parse_args()
 
     run_type, run_name, run_dir = parse_run(args.run)
@@ -221,7 +228,11 @@ def main():
     x_full_p2, x_red_p2 = load_paired_data(data_dir, index, stats, log)
     train2, val2 = make_loaders(TensorDataset(x_full_p2, x_red_p2))
 
-    enc2 = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
+    if args.lipschitz:
+        enc2 = LipschitzReducedAutoencoderEncoder(latent_dim=LATENT_DIM, sn_ceiling=args.sn_ceiling).to(DEVICE)
+        log(f"  using LipschitzReducedAutoencoderEncoder  sn_ceiling={args.sn_ceiling}")
+    else:
+        enc2 = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
     dec.requires_grad_(False)
     log(f"  reduced encoder params: {sum(p.numel() for p in enc2.parameters()):,}")
 
@@ -250,7 +261,12 @@ def main():
         train_mse = train_loss / n_train
         val_mse   = val_loss   / n_val
         phase2_epochs_run = epoch
-        log(f"  epoch {epoch:3d}/{PHASE2_MAX_EPOCHS}  train={train_mse:.4f}  val={val_mse:.4f}")
+        sn_str = ""
+        if args.lipschitz and epoch % 10 == 0:
+            sn = enc2.spectral_norms()
+            sn_max = max(sn.values())
+            sn_str = f"  sn_max={sn_max:.3f}"
+        log(f"  epoch {epoch:3d}/{PHASE2_MAX_EPOCHS}  train={train_mse:.4f}  val={val_mse:.4f}{sn_str}")
 
         if val_mse < best_val2:
             best_val2 = val_mse
@@ -274,9 +290,10 @@ def main():
         data=dict(n_sims=n_sims, data_dir=str(data_dir)),
         model=dict(
             encoder="AutoencoderEncoder",
-            reduced_encoder="ReducedAutoencoderEncoder",
+            reduced_encoder="LipschitzReducedAutoencoderEncoder" if args.lipschitz else "ReducedAutoencoderEncoder",
             decoder="WaveformDecoder",
             latent_dim=LATENT_DIM,
+            sn_ceiling=args.sn_ceiling if args.lipschitz else None,
         ),
         training=dict(
             phase1_epochs_run=phase1_epochs_run,

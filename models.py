@@ -7,13 +7,16 @@ SBI embeddings (used by train_sbi.py):
   TransformerWaveformEmbedding : transformer encoder on 4-ch + scalars → embed_dim (64)
 
 AE pre-training components (used by train_autoencoder.py + train_sbi.py ae-reduced):
-  AutoencoderEncoder           : full 28-ch CNN → latent_dim (128), phase 1
-  ReducedAutoencoderEncoder    : 4-ch CNN + scalar prefix tokens → latent_dim (128), phase 2
-  WaveformDecoder              : latent_dim → 512 → N_CHANNELS*T, phases 1 + 2
+  AutoencoderEncoder                : full 28-ch CNN → latent_dim (128), phase 1
+  ReducedAutoencoderEncoder         : 4-ch CNN + scalar prefix tokens → latent_dim (128), phase 2
+  LipschitzReducedAutoencoderEncoder: same as above + soft spectral-norm ceiling per layer
+  WaveformDecoder                   : latent_dim → 512 → N_CHANNELS*T, phases 1 + 2
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.utils.parametrize as P
 
 from dataset import N_CHANNELS, N_REDUCED_CHANNELS, N_SCALARS, T
 
@@ -278,6 +281,138 @@ class ReducedAutoencoderEncoder(nn.Module):
         }
 
     def forward(self, x):
+        waves   = x[:, :self.wave_len].view(-1, N_REDUCED_CHANNELS, T)
+        scalars = x[:, self.wave_len:]                                    # (B, 5)
+
+        h = self.cnn(waves).transpose(1, 2)                               # (B, T', 256)
+        scalar_tokens = torch.stack(
+            [proj(scalars[:, i:i+1]) for i, proj in enumerate(self.scalar_projs)],
+            dim=1,
+        )                                                                  # (B, 5, 256)
+        h = torch.cat([scalar_tokens, h], dim=1)                          # (B, T'+5, 256)
+        w = self.attn_pool(h).softmax(dim=1)
+        h = (w * h).sum(dim=1)
+        return self.proj(h)
+
+
+class _SoftSpectralCeiling(nn.Module):
+    """Weight parametrization: scale W down if sigma_1(W) exceeds `ceiling`, else leave unchanged.
+
+    Uses one step of power iteration per forward pass, warm-started from the previous step,
+    so the sigma_1 estimate is accurate after the first few training steps.
+
+    scale = min(1, ceiling / sigma_1)  →  effective sigma_1 = min(sigma_1, ceiling)
+    """
+
+    def __init__(self, ceiling: float, n_power_iters: int = 1):
+        super().__init__()
+        self.ceiling       = ceiling
+        self.n_power_iters = n_power_iters
+        self.register_buffer('_u', None)
+        self.register_buffer('_v', None)
+        self.last_sigma: float = 0.0   # updated each forward; readable for logging
+
+    def forward(self, W: torch.Tensor) -> torch.Tensor:
+        W_mat = W.reshape(W.shape[0], -1)            # (C_out, C_in*k) or (out, in)
+        h, w  = W_mat.shape
+
+        # warm-start or re-initialise if shape changed
+        if self._u is None or self._u.shape[0] != h:
+            self._u = F.normalize(W_mat.new_empty(h).normal_(), dim=0)
+        if self._v is None or self._v.shape[0] != w:
+            self._v = F.normalize(W_mat.new_empty(w).normal_(), dim=0)
+
+        u, v = self._u.detach(), self._v.detach()
+        with torch.no_grad():
+            for _ in range(self.n_power_iters):
+                v = F.normalize(W_mat.t() @ u, dim=0, eps=1e-12)
+                u = F.normalize(W_mat @ v,     dim=0, eps=1e-12)
+
+        sigma = (u @ (W_mat @ v)).abs()
+
+        if self.training:
+            self._u.copy_(u)
+            self._v.copy_(v)
+
+        # scale = 1 when sigma <= ceiling; ceiling/sigma when sigma > ceiling
+        scale = (self.ceiling / sigma.clamp(min=1e-12)).clamp(max=1.0)
+        # store effective sigma (= min(sigma, ceiling)) so spectral_norms() is directly checkable
+        self.last_sigma = (sigma * scale).item()
+        return W * scale
+
+    def right_inverse(self, W: torch.Tensor) -> torch.Tensor:
+        return W   # identity: parametrize stores the original weight as-is
+
+
+def _sn(module: nn.Module, ceiling: float) -> nn.Module:
+    P.register_parametrization(module, 'weight', _SoftSpectralCeiling(ceiling))
+    return module
+
+
+class LipschitzReducedAutoencoderEncoder(nn.Module):
+    """ReducedAutoencoderEncoder with a soft spectral-norm ceiling on every weight matrix.
+
+    Each Conv1d and Linear layer is wrapped so its spectral norm (largest singular value)
+    is clamped to at most `sn_ceiling`.  When sigma_1 <= sn_ceiling the weights are
+    unchanged; when sigma_1 > sn_ceiling the weight is rescaled to sigma_1 = sn_ceiling.
+
+    This prevents the encoder from arbitrarily stretching latent space, which is the root
+    cause of real patients landing far outside the sim distribution.  The decoder and flow
+    are NOT constrained — only the encoder maps inputs to the shared latent space.
+
+    `spectral_norms()` returns the last estimated sigma_1 per layer; call it after a
+    forward pass to verify the ceiling is active during training.
+    """
+
+    CONV_LAYERS = ReducedAutoencoderEncoder.CONV_LAYERS
+
+    def __init__(self, latent_dim: int = LATENT_DIM, sn_ceiling: float = 2.0):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.sn_ceiling = sn_ceiling
+        self.wave_len   = N_REDUCED_CHANNELS * T
+        feat_dim = self.CONV_LAYERS[-1][1]
+
+        layers = []
+        for in_ch, out_ch, k, s in self.CONV_LAYERS:
+            layers += [
+                _sn(nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2, stride=s), sn_ceiling),
+                nn.SiLU(),
+            ]
+        self.cnn          = nn.Sequential(*layers)
+        self.scalar_projs = nn.ModuleList(
+            [_sn(nn.Linear(1, feat_dim), sn_ceiling) for _ in range(N_SCALARS)]
+        )
+        self.attn_pool    = _sn(nn.Linear(feat_dim, 1), sn_ceiling)
+        self.proj         = _sn(nn.Linear(feat_dim, latent_dim), sn_ceiling)
+
+    @property
+    def output_dim(self):
+        return self.latent_dim
+
+    def spectral_norms(self) -> dict[str, float]:
+        """Return last estimated sigma_1 for every constrained layer.
+
+        Call after a forward pass (values are 0.0 before the first forward).
+        All values should be <= sn_ceiling if the ceiling is active.
+        """
+        out = {}
+        for name, mod in self.named_modules():
+            if isinstance(mod, _SoftSpectralCeiling):
+                out[name] = mod.last_sigma
+        return out
+
+    def describe(self):
+        return {
+            "type": "LipschitzReducedAutoencoderEncoder",
+            "input_waveforms": f"({N_REDUCED_CHANNELS}, {T})",
+            "input_scalars": "Pas_mean, Pas_max, Pas_min, SV, HR_z",
+            "latent_dim": self.latent_dim,
+            "sn_ceiling": self.sn_ceiling,
+            "n_params": sum(p.numel() for p in self.parameters()),
+        }
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         waves   = x[:, :self.wave_len].view(-1, N_REDUCED_CHANNELS, T)
         scalars = x[:, self.wave_len:]                                    # (B, 5)
 
