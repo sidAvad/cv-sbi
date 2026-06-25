@@ -1,33 +1,30 @@
 """
-Phase 4 (OT): Fine-tune enc_reduced via Sinkhorn divergence domain adaptation.
+Phase 4 (OT): Adapt enc_reduced to real patients via Sinkhorn OT.
 
-Replaces MMD with geomloss.SamplesLoss("sinkhorn") — computes a soft transport
-plan between real and sim latents, giving a per-sample gradient signal rather
-than an aggregate distributional statistic. More informative than MMD when
-n_real is small (60 patients).
+Trains a real-patient encoder (enc_real) to map real latents toward the sim
+latent distribution defined by a frozen copy of the same checkpoint (enc_frozen).
+Pure Sinkhorn divergence — no flow LL, no anchor loss.
 
-The frozen sim target defaults to phase2_encoder.pt from --run, but can be
-overridden with --sim-encoder-ckpt to target a jointly-trained encoder (e.g.
-extracted from posterior.pt via extract_encoder.py).
+At inference: z_real = real_encoder(x_real), z_sim = base posterior embedding_net(x_sim).
+NN search compares z_real to z_sim; posterior conditions on x_nn via the base embedding_net.
 
 Usage:
     python train_ot.py
         --run exp_cnn4e64-ae-reduced_maf5_freeze-maf_1M
         --real-data ~/real_data/multibeat
-        --output-run exp_cnn4e64-ae-reduced_maf5_freeze-maf_1M_ot-sinkhorn
+        --output-run exp_cnn4e64-ae-reduced_1M_ot-sinkhorn
         --sim-data-root /media/local/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314
-        [--warm-start outputs/exp_.../encoder.pt]
-        [--sim-encoder-ckpt outputs/exp_.../enc_maf_joint.pt]
+        [--encoder-ckpt path/to/enc_joint.pt]
 """
 
 import argparse
+import csv
 import json
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-import csv
 import h5py
 import numpy as np
 import torch
@@ -37,7 +34,7 @@ from torch.utils.data import DataLoader
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-from dataset import ReducedCVDataset, load_stats, load_manifest, PARAM_KEYS_INFER
+from dataset import ReducedCVDataset, load_stats, load_manifest
 from models import ReducedAutoencoderEncoder, LATENT_DIM
 
 
@@ -126,17 +123,6 @@ def load_real_patients(data_dir: Path, stats: dict, log) -> list[torch.Tensor]:
     return patient_tensors
 
 
-def patient_averaged_latents(enc, patient_tensors: list[torch.Tensor]) -> torch.Tensor:
-    """Encode all beats per patient, average latents. Returns (n_patients, latent_dim)."""
-    enc.eval()
-    averaged = []
-    with torch.no_grad():
-        for beats in patient_tensors:
-            z = enc(beats.to(DEVICE))
-            averaged.append(z.mean(dim=0))
-    return torch.stack(averaged)
-
-
 def load_sim_data(data_dir: Path, manifest: dict, stats: dict, n: int, log) -> torch.Tensor:
     index   = manifest["index"][:n]
     dataset = ReducedCVDataset(str(data_dir), index, stats)
@@ -156,34 +142,22 @@ def load_sim_data(data_dir: Path, manifest: dict, stats: dict, n: int, log) -> t
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run",           required=True,
-                        help="Base ae-reduced run (provides phase2_encoder.pt + posterior.pt)")
+                        help="Base ae-reduced run (provides posterior.pt)")
     parser.add_argument("--real-data",     required=True)
     parser.add_argument("--output-run",    required=True,
                         help="Output run name")
     parser.add_argument("--sim-data-root", required=True)
-    parser.add_argument("--warm-start",    default=None,
-                        help="Path to an encoder checkpoint to warm-start from. "
+    parser.add_argument("--encoder-ckpt",  default=None,
+                        help="Encoder checkpoint for both enc_real (trainable) and enc_frozen (sim target). "
                              "Default: phase2_encoder.pt from --run.")
-    parser.add_argument("--sim-encoder-ckpt", default=None,
-                        help="Path to encoder checkpoint defining the frozen sim target distribution. "
-                             "Default: phase2_encoder.pt from --run. Override with a jointly-trained "
-                             "encoder (e.g. enc_maf_joint.pt extracted from posterior.pt) to OT into "
-                             "the NPE-shaped latent space.")
     parser.add_argument("--n-sim",         type=int,   default=N_SIM_DEFAULT)
     parser.add_argument("--sim-batch",     type=int,   default=512,
-                        help="Sim latents sampled per epoch from z_sim_all. "
-                             "Precomputes all --n-sim latents once, subsamples each epoch.")
+                        help="Sim latents subsampled per epoch from z_sim_all (precomputed once).")
     parser.add_argument("--lr",            type=float, default=LR)
     parser.add_argument("--weight-decay",  type=float, default=1e-4)
     parser.add_argument("--grad-clip",     type=float, default=1.0)
     parser.add_argument("--blur",          type=float, default=0.5,
-                        help="Sinkhorn blur (entropic regularisation ε). "
-                             "Smaller = sharper transport plan, less smoothing.")
-    parser.add_argument("--beta-ll",       type=float, default=0.0001,
-                        help="Weight for flow log-likelihood term. "
-                             "L = L_OT - beta_ll * E[log p_flow(theta|z_real)]. "
-                             "Flow is frozen; gradient flows through z_real → enc_real. "
-                             "Set 0 for OT-only training.")
+                        help="Sinkhorn blur (entropic regularisation ε).")
     parser.add_argument("--epochs",        type=int,   default=MAX_EPOCHS)
     parser.add_argument("--patience",      type=int,   default=PATIENCE)
     parser.add_argument("--dry-run",       action="store_true",
@@ -191,15 +165,14 @@ def main():
     args = parser.parse_args()
 
     if args.dry_run:
-        args.epochs   = 2
-        args.n_sim    = 512
+        args.epochs    = 2
+        args.n_sim     = 512
         args.sim_batch = 512
-        args.patience = 999
+        args.patience  = 999
 
-    real_data_name = Path(args.real_data).name
-    base_run_dir   = Path("outputs") / args.run
-    out_root       = Path("dry-runs") if args.dry_run else Path("outputs")
-    ot_run_dir     = out_root / args.output_run
+    base_run_dir = Path("outputs") / args.run
+    out_root     = Path("dry-runs") if args.dry_run else Path("outputs")
+    ot_run_dir   = out_root / args.output_run
     ot_run_dir.mkdir(parents=True, exist_ok=True)
 
     date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -213,9 +186,7 @@ def main():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
     log(f"OT fine-tuning: {args.run} → {args.output_run}  ({'DRY RUN' if args.dry_run else 'full'})")
-    log(f"Device: {DEVICE}  lr: {args.lr}  blur: {args.blur}  (fixed sim target — no anchor loss)")
-    log(f"warm-start: {args.warm_start or 'phase2_encoder.pt (default)'}")
-    log(f"sim-encoder-ckpt: {args.sim_encoder_ckpt or 'phase2_encoder.pt (default)'}")
+    log(f"Device: {DEVICE}  lr={args.lr}  blur={args.blur}")
 
     stats    = load_stats(STATS_PATH)
     manifest = load_manifest(Path(args.sim_data_root) / "manifest_train.json")
@@ -227,76 +198,37 @@ def main():
         Path(args.sim_data_root) / "train", manifest, stats, args.n_sim, log
     )
 
-    # Load encoder — warm-start from existing checkpoint or cold-start from phase2
-    if args.warm_start:
-        ckpt = Path(args.warm_start)
-        if not ckpt.exists():
-            raise FileNotFoundError(f"--warm-start path not found: {ckpt}")
-        log(f"Warm-starting from {ckpt}")
-    else:
-        ckpt = base_run_dir / "phase2_encoder.pt"
-        if not ckpt.exists():
-            raise FileNotFoundError(f"{ckpt} not found")
-        log(f"Cold-starting from {ckpt}")
+    ckpt = Path(args.encoder_ckpt) if args.encoder_ckpt else base_run_dir / "phase2_encoder.pt"
+    if not ckpt.exists():
+        raise FileNotFoundError(f"Encoder checkpoint not found: {ckpt}")
+    log(f"Encoder checkpoint: {ckpt}")
 
     enc = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
     enc.load_state_dict(torch.load(ckpt, map_location=DEVICE))
 
-    # Frozen sim encoder — defines the fixed target distribution.
-    # Defaults to phase2_encoder.pt; override with --sim-encoder-ckpt to target
-    # a jointly-trained (NPE-shaped) latent space.
-    sim_ckpt = (
-        Path(args.sim_encoder_ckpt) if args.sim_encoder_ckpt
-        else base_run_dir / "phase2_encoder.pt"
-    )
-    if not sim_ckpt.exists():
-        raise FileNotFoundError(f"--sim-encoder-ckpt not found: {sim_ckpt}")
     enc_frozen = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
-    enc_frozen.load_state_dict(torch.load(sim_ckpt, map_location=DEVICE))
+    enc_frozen.load_state_dict(torch.load(ckpt, map_location=DEVICE))
     enc_frozen.requires_grad_(False)
     enc_frozen.eval()
-    log(f"Sim target encoder fixed to {sim_ckpt}")
 
     log("Pre-computing sim latents (enc_frozen, all sims)...")
     z_sim_chunks = []
     with torch.no_grad():
         for i in range(0, len(x_sim), 512):
             z_sim_chunks.append(enc_frozen(x_sim[i:i+512].to(DEVICE)))
-    z_sim_all = torch.cat(z_sim_chunks)  # (n_sim, latent_dim) on GPU
+    z_sim_all = torch.cat(z_sim_chunks)
     del x_sim, z_sim_chunks
-    log(f"z_sim_all: {tuple(z_sim_all.shape)}  GPU mem allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-
-    # Flow log-likelihood term: p_flow(theta | z_real) — flow is frozen, gradient flows through z_real
-    if args.beta_ll > 0:
-        post = torch.load(base_run_dir / "posterior.pt", map_location=DEVICE, weights_only=False)
-        flow_net = post.posterior_estimator.net  # raw nflows flow — takes (theta, context=z) directly
-        flow_net.eval()
-        flow_net.requires_grad_(False)
-        lo_t = torch.tensor(
-            [manifest["config"]["pvar_low"][k]  for k in PARAM_KEYS_INFER],
-            dtype=torch.float32, device=DEVICE
-        )
-        hi_t = torch.tensor(
-            [manifest["config"]["pvar_high"][k] for k in PARAM_KEYS_INFER],
-            dtype=torch.float32, device=DEVICE
-        )
-        del post
-        log(f"Flow LL enabled: beta_ll={args.beta_ll}  |theta|={len(PARAM_KEYS_INFER)}  "
-            f"flow from {base_run_dir / 'posterior.pt'}")
-    else:
-        flow_net = None
-        log("Flow LL disabled (beta_ll=0)")
+    log(f"z_sim_all: {tuple(z_sim_all.shape)}  GPU mem: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
     sinkhorn = SamplesLoss("sinkhorn", p=2, blur=args.blur, backend="tensorized")
-    log(f"Sinkhorn loss: p=2  blur={args.blur}  backend=tensorized")
+    log(f"Sinkhorn: p=2  blur={args.blur}  backend=tensorized")
 
-    # Log initial Sinkhorn divergence (uses z_sim_all — consistent with training)
     with torch.no_grad():
-        z_real_init = patient_averaged_latents(enc, patient_tensors)
+        z_real_init = torch.stack([enc(beats.to(DEVICE)).mean(0) for beats in patient_tensors])
     log(f"Initial Sinkhorn: {sinkhorn(z_real_init, z_sim_all).item():.4f}")
 
     opt = torch.optim.Adam(enc.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    log(f"Optimiser: Adam lr={args.lr}  weight_decay={args.weight_decay}  grad_clip={args.grad_clip}")
+    log(f"Adam lr={args.lr}  weight_decay={args.weight_decay}  grad_clip={args.grad_clip}")
 
     best_loss  = float("inf")
     wait       = 0
@@ -305,94 +237,59 @@ def main():
     csv_path = ot_run_dir / f"train_log_{date_str}.csv"
     csv_fh   = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_fh)
-    csv_writer.writerow(["epoch", "ot_loss", "ll_mean", "total_loss"])
+    csv_writer.writerow(["epoch", "ot_loss"])
 
     log("Training...")
     for epoch in range(1, args.epochs + 1):
         enc.train()
-
-        # Encode real patients with gradients (patient_averaged_latents uses no_grad)
-        enc.train()
         z_real_list = [enc(beats.to(DEVICE)).mean(dim=0) for beats in patient_tensors]
-        z_real = torch.stack(z_real_list)  # (n_patients, latent_dim) — grad enabled
+        z_real = torch.stack(z_real_list)
 
-        idx     = torch.randperm(len(z_sim_all), device=DEVICE)[:args.sim_batch]
-        ot_loss = sinkhorn(z_real, z_sim_all[idx])
-
-        if flow_net is not None:
-            # Sample 1 theta per patient from uniform prior (no grad needed for theta)
-            with torch.no_grad():
-                u = torch.rand(len(patient_tensors), len(lo_t), device=DEVICE)
-                theta_samples = lo_t + u * (hi_t - lo_t)
-            # Bypass flow._embedding_net (enc_maf_joint): z_real IS already the embedded
-            # context. Calling flow_net.log_prob would re-encode z_real through enc_maf_joint.
-            # Instead use _transform + _distribution directly (matches flow._log_prob internals).
-            # Theta standardization is the first transform in flow._transform — no manual
-            # normalization needed. Gradient flows through z_real → enc; flow_net is frozen.
-            noise, logabsdet = flow_net._transform(theta_samples, context=z_real)
-            ll = flow_net._distribution.log_prob(noise, context=z_real) + logabsdet
-            ll = ll.nan_to_num(nan=0.0, posinf=0.0)  # only guard NaN and +inf
-            ll_val = ll.mean().item()
-            loss = ot_loss - args.beta_ll * ll.mean()
-        else:
-            ll_val = 0.0
-            loss = ot_loss
+        idx  = torch.randperm(len(z_sim_all), device=DEVICE)[:args.sim_batch]
+        loss = sinkhorn(z_real, z_sim_all[idx])
 
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(enc.parameters(), args.grad_clip)
         opt.step()
 
-        ot_val    = ot_loss.item()
-        total_val = loss.item()
-        csv_writer.writerow([epoch, f"{ot_val:.6f}", f"{ll_val:.4f}", f"{total_val:.6f}"])
+        loss_val = loss.item()
+        csv_writer.writerow([epoch, f"{loss_val:.6f}"])
         csv_fh.flush()
 
-        if total_val < best_loss:
-            best_loss  = total_val
+        if loss_val < best_loss:
+            best_loss  = loss_val
             wait       = 0
             best_state = {k: v.clone() for k, v in enc.state_dict().items()}
         else:
             wait += 1
 
         if epoch % LOG_EVERY == 0 or epoch == 1:
-            if flow_net is not None:
-                log(f"  epoch {epoch:4d}/{args.epochs}  ot={ot_val:.4f}  ll={ll_val:.2f}  "
-                    f"total={total_val:.4f}  best={best_loss:.4f}  wait={wait}")
-            else:
-                log(f"  epoch {epoch:4d}/{args.epochs}  ot={ot_val:.4f}  best={best_loss:.4f}  wait={wait}")
+            log(f"  epoch {epoch:4d}/{args.epochs}  ot={loss_val:.4f}  best={best_loss:.4f}  wait={wait}")
 
         if wait >= args.patience:
-            log(f"  early stop at epoch {epoch}  best_total={best_loss:.4f}")
+            log(f"  early stop at epoch {epoch}  best={best_loss:.4f}")
             break
 
     csv_fh.close()
-    log(f"Saved {csv_path.name}")
 
     enc.load_state_dict(best_state)
-    # Save as real_encoder.pt — this encoder is for real patients only.
-    # Sims are encoded by the frozen sim encoder (enc_frozen / --sim-encoder-ckpt).
-    # At inference: z_real = real_encoder(x_real), z_sim = base posterior's embedding_net(x_sim).
-    # NN search compares z_real to z_sim; posterior conditions on x_nn via the base embedding_net.
     torch.save(enc.state_dict(), ot_run_dir / "real_encoder.pt")
-    log("Saved real_encoder.pt — transport map for real patients (NOT for sims)")
+    log("Saved real_encoder.pt")
 
     if args.dry_run:
         log("Dry run — posterior not copied.")
     else:
         import shutil
         shutil.copy(base_run_dir / "posterior.pt", ot_run_dir / "posterior.pt")
-        log(f"Copied base run posterior unchanged → {ot_run_dir / 'posterior.pt'}")
-        log("Posterior embedding_net is the original base encoder (enc_maf_joint), not real_encoder")
+        log(f"Copied posterior.pt from {base_run_dir.name}")
 
     run_info = dict(
         run=args.output_run,
         command=" ".join(sys.argv),
         base_run=args.run,
-        warm_start=str(args.warm_start) if args.warm_start else None,
-        sim_encoder_ckpt=str(sim_ckpt),
+        encoder_ckpt=str(ckpt),
         real_data=str(args.real_data),
-        real_data_name=real_data_name,
         n_patients=len(patient_tensors),
         n_beats=sum(t.shape[0] for t in patient_tensors),
         timestamp=datetime.now().isoformat(timespec="seconds"),
@@ -403,19 +300,15 @@ def main():
             weight_decay=args.weight_decay,
             grad_clip=args.grad_clip,
             blur=args.blur,
-            beta_ll=args.beta_ll,
             max_epochs=args.epochs,
             patience=args.patience,
             n_sim=args.n_sim,
-            sim_target="all_precomputed",
-            n_sim_target=len(z_sim_all),
             sim_batch=args.sim_batch,
-            best_total_loss=best_loss,
+            best_ot_loss=best_loss,
         ),
     )
-    info_path = ot_run_dir / f"run_info_{date_str}.json"
-    info_path.write_text(json.dumps(run_info, indent=2))
-    log(f"Saved {info_path.name}")
+    (ot_run_dir / f"run_info_{date_str}.json").write_text(json.dumps(run_info, indent=2))
+    log("Saved run_info")
 
     log_fh.close()
     sys.stdout = _stdout
