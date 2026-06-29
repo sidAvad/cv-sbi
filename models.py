@@ -6,11 +6,16 @@ SBI embeddings (used by train_sbi.py):
   ReducedWaveformEmbedding     : 4-ch CNN + scalar prefix tokens → embed_dim (64)
   TransformerWaveformEmbedding : transformer encoder on 4-ch + scalars → embed_dim (64)
 
-AE pre-training components (used by train_autoencoder.py + train_sbi.py ae-reduced):
+AE pre-training components — legacy (old runs):
   AutoencoderEncoder                : full 28-ch CNN → latent_dim (128), phase 1
   ReducedAutoencoderEncoder         : 4-ch CNN + scalar prefix tokens → latent_dim (128), phase 2
   LipschitzReducedAutoencoderEncoder: same as above + soft spectral-norm ceiling per layer
   WaveformDecoder                   : latent_dim → 512 → N_CHANNELS*T, phases 1 + 2
+
+AE pre-training components — v2 (new runs, hourglass encoder + multi-layer decoder):
+  ContAutoencoderEncoder            : 24-ch hourglass CNN → latent_dim, phase 1
+  LipschitzContAutoencoderEncoder   : same + soft spectral-norm ceiling per layer, phase 1
+  MultiHeadWaveformDecoder          : latent_dim → deep MLP → (B, N_CONT, T), phases 1 + 2
 """
 
 import torch
@@ -18,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrize as P
 
-from dataset import N_CHANNELS, N_REDUCED_CHANNELS, N_SCALARS, T
+from dataset import N_CHANNELS, N_CONT, N_REDUCED_CHANNELS, N_SCALARS, T
 
 EMBED_DIM  = 64
 LATENT_DIM = 128
@@ -450,3 +455,137 @@ class WaveformDecoder(nn.Module):
 
     def forward(self, z):
         return self.net(z)
+
+
+# ── AE v2: hourglass encoder + deep decoder (new runs) ───────────────────────
+
+class ContAutoencoderEncoder(nn.Module):
+    """24-ch continuous CNN → latent_dim. Hourglass channel structure.
+
+    Phase 1 of AE v2 pre-training. Takes only the 24 z-scored continuous
+    waveform channels (no valve signals). Expand-then-contract channel taper
+    distributes bottleneck pressure through the conv hierarchy rather than
+    dumping all compression onto the final linear projection.
+    """
+
+    CONV_LAYERS = [
+        (N_CONT, 64,  7, 1),   # 24 → 64,  local features
+        (64,     128, 5, 2),   # 64 → 128, expand, stride-2 downsample
+        (128,    64,  5, 2),   # 128 → 64, contract, stride-2 downsample
+        (64,     64,  3, 1),   # 64 → 64,  refine
+    ]
+
+    def __init__(self, latent_dim: int = LATENT_DIM):
+        super().__init__()
+        self.latent_dim = latent_dim
+        feat_dim = self.CONV_LAYERS[-1][1]  # 64
+
+        layers = []
+        for in_ch, out_ch, k, s in self.CONV_LAYERS:
+            layers += [nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2, stride=s), nn.SiLU()]
+        self.cnn       = nn.Sequential(*layers)
+        self.attn_pool = nn.Linear(feat_dim, 1)
+        self.proj      = nn.Linear(feat_dim, latent_dim)
+
+    def describe(self):
+        return {
+            "type": "ContAutoencoderEncoder",
+            "input": f"({N_CONT}, {T})",
+            "latent_dim": self.latent_dim,
+            "n_params": sum(p.numel() for p in self.parameters()),
+        }
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.cnn(x.view(-1, N_CONT, T)).transpose(1, 2)  # (B, T', 64)
+        w = self.attn_pool(h).softmax(dim=1)
+        h = (w * h).sum(dim=1)                                # (B, 64)
+        return self.proj(h)                                   # (B, latent_dim)
+
+
+class LipschitzContAutoencoderEncoder(nn.Module):
+    """ContAutoencoderEncoder with a soft spectral-norm ceiling on every weight matrix.
+
+    Phase 1 of AE v2 pre-training when --lipschitz is set. Prevents the encoder
+    from arbitrarily stretching the latent space, keeping the sim distribution
+    compact and amenable to OT transport.
+    """
+
+    CONV_LAYERS = ContAutoencoderEncoder.CONV_LAYERS
+
+    def __init__(self, latent_dim: int = LATENT_DIM, sn_ceiling: float = 2.0):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.sn_ceiling = sn_ceiling
+        feat_dim = self.CONV_LAYERS[-1][1]  # 64
+
+        layers = []
+        for in_ch, out_ch, k, s in self.CONV_LAYERS:
+            layers += [
+                _sn(nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2, stride=s), sn_ceiling),
+                nn.SiLU(),
+            ]
+        self.cnn       = nn.Sequential(*layers)
+        self.attn_pool = _sn(nn.Linear(feat_dim, 1), sn_ceiling)
+        self.proj      = _sn(nn.Linear(feat_dim, latent_dim), sn_ceiling)
+
+    @property
+    def output_dim(self):
+        return self.latent_dim
+
+    def spectral_norms(self) -> dict[str, float]:
+        out = {}
+        for name, mod in self.named_modules():
+            if isinstance(mod, _SoftSpectralCeiling):
+                out[name] = mod.last_sigma
+        return out
+
+    def describe(self):
+        return {
+            "type": "LipschitzContAutoencoderEncoder",
+            "input": f"({N_CONT}, {T})",
+            "latent_dim": self.latent_dim,
+            "sn_ceiling": self.sn_ceiling,
+            "n_params": sum(p.numel() for p in self.parameters()),
+        }
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.cnn(x.view(-1, N_CONT, T)).transpose(1, 2)  # (B, T', 64)
+        w = self.attn_pool(h).softmax(dim=1)
+        h = (w * h).sum(dim=1)                                # (B, 64)
+        return self.proj(h)                                   # (B, latent_dim)
+
+
+class MultiHeadWaveformDecoder(nn.Module):
+    """Deep MLP decoder: latent_dim → trunk (n_layers × hidden) → (B, N_CONT, T).
+
+    Replaces WaveformDecoder for AE v2 runs. Outputs only the 24 z-scored
+    continuous channels — valve signals are dropped (they are redundant given
+    the pressure/flow/volume channels). The deeper trunk gives the decoder
+    capacity to invert the hourglass encoder.
+    """
+
+    def __init__(self, latent_dim: int = LATENT_DIM, hidden: int = 1024, n_layers: int = 6):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden     = hidden
+        self.n_layers   = n_layers
+
+        trunk = [nn.Linear(latent_dim, hidden), nn.SiLU()]
+        for _ in range(n_layers - 1):
+            trunk += [nn.Linear(hidden, hidden), nn.SiLU()]
+        self.trunk     = nn.Sequential(*trunk)
+        self.cont_head = nn.Linear(hidden, N_CONT * T)
+
+    def describe(self):
+        return {
+            "type": "MultiHeadWaveformDecoder",
+            "latent_dim": self.latent_dim,
+            "hidden": self.hidden,
+            "n_layers": self.n_layers,
+            "output": f"({N_CONT}, {T})",
+            "n_params": sum(p.numel() for p in self.parameters()),
+        }
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        B = z.shape[0]
+        return self.cont_head(self.trunk(z)).view(B, N_CONT, T)  # (B, N_CONT, T)

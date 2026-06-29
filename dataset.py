@@ -58,6 +58,8 @@ _VLV_IDX = WAVE_KEYS_CONT.index("Vlv")
 N_REDUCED_CHANNELS = len(WAVE_KEYS_REDUCED)        # 4
 N_SCALARS          = 5                              # Pas mean/max/min, SV, HR
 OBS_DIM            = N_REDUCED_CHANNELS * T + N_SCALARS  # 809
+N_CONT             = len(WAVE_KEYS_CONT)            # 24
+N_VALVE            = len(WAVE_KEYS_VALVE)           # 4
 
 
 def compute_summary_stats(x: torch.Tensor) -> torch.Tensor:
