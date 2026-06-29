@@ -342,6 +342,13 @@ def main():
     if not is_dry:
         log("Building and saving posterior...")
         posterior = inference.build_posterior(density_estimator)
+        # parametrize blocks torch.save — bake constrained weights into tensors before pickling
+        if use_ae_reduced_lipschitz:
+            import torch.nn.utils.parametrize as P
+            for mod in posterior.posterior_estimator.embedding_net.modules():
+                if P.is_parametrized(mod):
+                    P.remove_parametrizations(mod, 'weight', leave_parametrized=True)
+            log("Spectral-norm parametrizations removed (weights baked in) for serialization")
         torch.save(posterior, run_dir / "posterior.pt")
         log(f"Saved posterior to {run_dir / 'posterior.pt'}")
     else:

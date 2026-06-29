@@ -160,7 +160,7 @@ def main():
 
     run_type, run_name, run_dir = parse_run(args.run)
     is_dry    = run_type == "dry"
-    n_sims    = N_SIMS_DRY if is_dry else (args.n_sims or N_SIMS_DEFAULT)
+    n_sims    = args.n_sims if args.n_sims else (N_SIMS_DRY if is_dry else N_SIMS_DEFAULT)
     data_root = Path(args.data_root)
     data_dir  = data_root / "train"
     manifest_path = data_root / "manifest_train.json"
