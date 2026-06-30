@@ -146,6 +146,8 @@ def main():
                              "sumstats: hand-crafted")
     parser.add_argument("--freeze-epochs", type=int, default=0,
                         help="Epochs to train embedding only before joint training (0 = no freeze)")
+    parser.add_argument("--stop-after-epochs", type=int, default=20,
+                        help="Patience: stop if val log-prob hasn't improved for this many epochs (default: 20)")
     parser.add_argument("--freeze-embedding", action="store_true",
                         help="Freeze embedding net throughout — only the flow is trained. "
                              "Use with --encoder-ckpt to train NSF on a fixed MMD-adapted encoder.")
@@ -339,6 +341,7 @@ def main():
         resume_training=args.freeze_epochs > 0,
         training_batch_size=BATCH_SIZE,
         show_train_summary=True,
+        stop_after_epochs=args.stop_after_epochs,
     )
 
     if not is_dry:
