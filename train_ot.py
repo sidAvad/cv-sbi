@@ -150,6 +150,8 @@ def main():
     parser.add_argument("--encoder-ckpt",  default=None,
                         help="Encoder checkpoint for both enc_real (trainable) and enc_frozen (sim target). "
                              "Default: phase2_encoder.pt from --run.")
+    parser.add_argument("--latent-dim",     type=int,   default=LATENT_DIM,
+                        help="Latent dimension of the AE encoder (must match checkpoint, default: 128)")
     parser.add_argument("--n-sim",         type=int,   default=N_SIM_DEFAULT)
     parser.add_argument("--sim-batch",     type=int,   default=512,
                         help="Sim latents subsampled per epoch from z_sim_all (precomputed once).")
@@ -203,10 +205,10 @@ def main():
         raise FileNotFoundError(f"Encoder checkpoint not found: {ckpt}")
     log(f"Encoder checkpoint: {ckpt}")
 
-    enc = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
+    enc = ReducedAutoencoderEncoder(latent_dim=args.latent_dim).to(DEVICE)
     enc.load_state_dict(torch.load(ckpt, map_location=DEVICE))
 
-    enc_frozen = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
+    enc_frozen = ReducedAutoencoderEncoder(latent_dim=args.latent_dim).to(DEVICE)
     enc_frozen.load_state_dict(torch.load(ckpt, map_location=DEVICE))
     enc_frozen.requires_grad_(False)
     enc_frozen.eval()
