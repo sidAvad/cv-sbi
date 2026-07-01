@@ -36,7 +36,7 @@ from dataset import (
     compute_summary_stats, N_SUMSTATS,
 )
 from models import (
-    WaveformEmbedding, ReducedWaveformEmbedding, TransformerWaveformEmbedding,
+    WaveformEmbedding, ReducedWaveformEmbedding,
     ReducedAutoencoderEncoder, LipschitzReducedAutoencoderEncoder,
     EMBED_DIM, LATENT_DIM,
 )
@@ -136,11 +136,10 @@ def main():
                         help="Dataset root containing train/ and manifest_train.json")
     parser.add_argument("--embedding",
                         choices=["cnn", "cnn-meanpool", "sumstats", "cnn-reduced",
-                                 "transformer-reduced", "ae-reduced", "ae-reduced-lipschitz"],
+                                 "ae-reduced", "ae-reduced-lipschitz"],
                         default="cnn",
                         help="cnn: full 28-ch CNN attn pool; cnn-meanpool: full 28-ch CNN mean pool; "
                              "cnn-reduced: 4-ch CNN + scalar prefix tokens; "
-                             "transformer-reduced: transformer encoder on 4-ch + scalars; "
                              "ae-reduced: load phase2_encoder.pt (ReducedAutoencoderEncoder, 128-dim); "
                              "ae-reduced-lipschitz: same with soft spectral-norm ceiling (LipschitzReducedAutoencoderEncoder); "
                              "sumstats: hand-crafted")
@@ -180,7 +179,6 @@ def main():
     run_type, run_name, run_dir = parse_run(args.run)
     is_dry          = run_type == "dry"
     use_reduced              = args.embedding == "cnn-reduced"
-    use_transformer          = args.embedding == "transformer-reduced"
     use_ae_reduced           = args.embedding in ("ae-reduced", "ae-reduced-lipschitz")
     use_ae_reduced_lipschitz = args.embedding == "ae-reduced-lipschitz"
     use_sumstats             = args.embedding == "sumstats"
@@ -231,12 +229,6 @@ def main():
         z_score_x      = "none"
         dataset_cls    = ReducedCVDataset
         param_keys     = PARAM_KEYS_INFER
-    elif use_transformer:
-        embedding_net = TransformerWaveformEmbedding()
-        embedding_info = embedding_net.describe()
-        z_score_x   = "none"
-        dataset_cls = ReducedCVDataset
-        param_keys  = PARAM_KEYS_INFER
     elif use_reduced:
         embedding_net = ReducedWaveformEmbedding()
         embedding_info = embedding_net.describe()
