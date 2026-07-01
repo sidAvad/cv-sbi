@@ -1,7 +1,7 @@
 """
-Phases 1 and 2 of autoencoder pre-training for cv-sbi (v2 architecture).
+Phases 1 and 2 of autoencoder pre-training for cv-sbi (v3 architecture).
 
-Phase 1: ContAutoencoderEncoder (24-ch hourglass CNN) + MultiHeadWaveformDecoder
+Phase 1: AutoencoderEncoder (24-ch CNN) + WaveformDecoder(n_layers=3, out_channels=N_CONT)
          trained to reconstruct the 24 continuous waveform channels from a
          latent_dim-dimensional latent (MSE + smoothness loss).
          Saves: phase1_encoder.pt, phase1_decoder.pt
@@ -11,15 +11,16 @@ Phase 2: Load phase1_decoder.pt and freeze it. Train ReducedAutoencoderEncoder
          the 24 continuous waveform channels through the frozen decoder.
          Saves: phase2_encoder.pt
 
-Use --lipschitz to apply spectral-norm ceiling to both phase 1 and phase 2 encoders.
+Use --lipschitz to apply spectral-norm ceiling to the phase 2 encoder.
+Use --proj-hidden to add a two-stage projection in the phase 2 encoder (e.g. 128 for 64-dim latent).
 
 After this script, run train_sbi.py --embedding ae-reduced to execute phases 3+4.
 
 Usage:
     python train_autoencoder.py \\
-        --run exp_cnn4e64-lipschitz-ae-reduced_maf5_freeze-maf \\
+        --run exp_cnn4e64-lipschitz-ae-reduced_1M \\
         --data-root /path/to/data \\
-        --latent-dim 32 --lipschitz
+        --latent-dim 64 --lipschitz --proj-hidden 128 --smoothness-weight 0.1
 """
 
 import argparse
@@ -44,9 +45,9 @@ from dataset import (
     N_CONT, T as T_STEPS,
 )
 from models import (
-    ContAutoencoderEncoder, LipschitzContAutoencoderEncoder,
+    AutoencoderEncoder,
     ReducedAutoencoderEncoder, LipschitzReducedAutoencoderEncoder,
-    MultiHeadWaveformDecoder, LATENT_DIM,
+    WaveformDecoder, LATENT_DIM,
 )
 
 
@@ -139,23 +140,26 @@ def make_loaders(tensor_ds):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run",       required=True,
-                        help="e.g. exp_cnn4e64-ae-reduced_maf5_freeze-maf")
+                        help="e.g. exp_cnn4e64-lipschitz-ae-reduced_1M")
     parser.add_argument("--data-root", required=True,
                         help="Dataset root containing train/ and manifest_train.json")
     parser.add_argument("--n-sims",           type=int,   default=None,
                         help="Number of simulations (dry runs always 512; full runs default 100k)")
-    parser.add_argument("--latent-dim",       type=int,   default=32,
-                        help="Latent space dimensionality (default: 32)")
+    parser.add_argument("--latent-dim",       type=int,   default=LATENT_DIM,
+                        help=f"Latent space dimensionality (default: {LATENT_DIM})")
     parser.add_argument("--hidden",           type=int,   default=512,
-                        help="Decoder trunk hidden width (default: 512)")
-    parser.add_argument("--n-layers",         type=int,   default=6,
-                        help="Decoder trunk depth (default: 6)")
+                        help="Decoder hidden width (default: 512)")
+    parser.add_argument("--n-layers",         type=int,   default=3,
+                        help="Decoder depth (default: 3)")
     parser.add_argument("--smoothness-weight",type=float, default=0.01,
                         help="Weight on TV smoothness penalty (default: 0.01)")
     parser.add_argument("--lipschitz",        action="store_true",
-                        help="Apply soft spectral-norm ceiling to both phase 1 and phase 2 encoders")
+                        help="Apply soft spectral-norm ceiling to the phase 2 encoder")
     parser.add_argument("--sn-ceiling",       type=float, default=2.0,
                         help="Spectral-norm ceiling per layer (default: 2.0, only with --lipschitz)")
+    parser.add_argument("--proj-hidden",      type=int,   default=None,
+                        help="Hidden dim for two-stage projection in phase 2 encoder "
+                             "(e.g. 128 for latent_dim=64). Default: single linear.")
     args = parser.parse_args()
 
     run_type, run_name, run_dir = parse_run(args.run)
@@ -180,7 +184,8 @@ def main():
 
     log(f"Run: {run_name}  ({'dry' if is_dry else 'full'})")
     log(f"Device: {DEVICE}  latent_dim: {args.latent_dim}  lipschitz: {args.lipschitz}"
-        + (f"  sn_ceiling: {args.sn_ceiling}" if args.lipschitz else ""))
+        + (f"  sn_ceiling: {args.sn_ceiling}" if args.lipschitz else "")
+        + (f"  proj_hidden: {args.proj_hidden}" if args.proj_hidden else ""))
     log(f"Decoder: hidden={args.hidden}  n_layers={args.n_layers}  smoothness_weight={args.smoothness_weight}")
     log(f"Phase 1: max {PHASE1_MAX_EPOCHS} epochs, Phase 2: max {PHASE2_MAX_EPOCHS} epochs")
     log(f"lr: {LR}  patience: {PATIENCE}  val_frac: {VAL_FRAC}")
@@ -195,18 +200,15 @@ def main():
         smooth_val = (pred[..., 1:] - pred[..., :-1]).pow(2).mean()
         return mse_val + args.smoothness_weight * smooth_val, mse_val, smooth_val
 
-    # ── Phase 1: cont encoder + decoder ──────────────────────────────────────
+    # ── Phase 1: full-24ch encoder + decoder ─────────────────────────────────
     log("Phase 1: loading full data into RAM...")
     x_full_all = load_full_data(data_dir, index, stats, log)
     train1, val1 = make_loaders(TensorDataset(x_full_all))
 
-    if args.lipschitz:
-        enc1 = LipschitzContAutoencoderEncoder(latent_dim=args.latent_dim, sn_ceiling=args.sn_ceiling).to(DEVICE)
-        log(f"  phase 1 encoder: LipschitzContAutoencoderEncoder  sn_ceiling={args.sn_ceiling}")
-    else:
-        enc1 = ContAutoencoderEncoder(latent_dim=args.latent_dim).to(DEVICE)
-        log(f"  phase 1 encoder: ContAutoencoderEncoder")
-    dec = MultiHeadWaveformDecoder(latent_dim=args.latent_dim, hidden=args.hidden, n_layers=args.n_layers).to(DEVICE)
+    enc1 = AutoencoderEncoder(latent_dim=args.latent_dim).to(DEVICE)
+    dec  = WaveformDecoder(latent_dim=args.latent_dim, hidden=args.hidden,
+                           n_layers=args.n_layers, out_channels=N_CONT).to(DEVICE)
+    log(f"  phase 1 encoder: AutoencoderEncoder")
     log(f"  encoder params: {sum(p.numel() for p in enc1.parameters()):,}")
     log(f"  decoder params: {sum(p.numel() for p in dec.parameters()):,}")
 
@@ -220,7 +222,7 @@ def main():
             x_batch  = x_batch.to(DEVICE)
             x_cont   = x_batch[:, :N_CONT_T]                        # (B, N_CONT*T)
             tgt      = x_cont.view(len(x_batch), N_CONT, T_STEPS)   # (B, N_CONT, T)
-            pred     = dec(enc1(x_cont))
+            pred     = dec(enc1(x_cont)).view(len(x_batch), N_CONT, T_STEPS)
             loss, _, _ = ae_loss(pred, tgt)
             opt1.zero_grad(); loss.backward(); opt1.step()
             train_loss += loss.item() * len(x_batch); n_train += len(x_batch)
@@ -232,7 +234,8 @@ def main():
                 x_batch = x_batch.to(DEVICE)
                 x_cont  = x_batch[:, :N_CONT_T]
                 tgt     = x_cont.view(len(x_batch), N_CONT, T_STEPS)
-                _, mse_v, smooth_v = ae_loss(dec(enc1(x_cont)), tgt)
+                pred_v  = dec(enc1(x_cont)).view(len(x_batch), N_CONT, T_STEPS)
+                _, mse_v, smooth_v = ae_loss(pred_v, tgt)
                 val_mse_sum    += mse_v.item()    * len(x_batch)
                 val_smooth_sum += smooth_v.item() * len(x_batch)
                 n_val          += len(x_batch)
@@ -242,12 +245,8 @@ def main():
         val_total  = val_mse + args.smoothness_weight * val_smooth
         phase1_epochs_run = epoch
 
-        sn_str = ""
-        if args.lipschitz and epoch % 10 == 0:
-            sn_max = max(enc1.spectral_norms().values())
-            sn_str = f"  sn_max={sn_max:.3f}"
         log(f"  epoch {epoch:3d}/{PHASE1_MAX_EPOCHS}  "
-            f"val_mse={val_mse:.4f}  val_smooth={val_smooth:.4f}  val_total={val_total:.4f}{sn_str}")
+            f"val_mse={val_mse:.4f}  val_smooth={val_smooth:.4f}  val_total={val_total:.4f}")
 
         if val_total < best_val1:
             best_val1 = val_total
@@ -272,11 +271,18 @@ def main():
     train2, val2 = make_loaders(TensorDataset(x_full_p2, x_red_p2))
 
     if args.lipschitz:
-        enc2 = LipschitzReducedAutoencoderEncoder(latent_dim=args.latent_dim, sn_ceiling=args.sn_ceiling).to(DEVICE)
-        log(f"  phase 2 encoder: LipschitzReducedAutoencoderEncoder  sn_ceiling={args.sn_ceiling}")
+        enc2 = LipschitzReducedAutoencoderEncoder(
+            latent_dim=args.latent_dim, sn_ceiling=args.sn_ceiling,
+            proj_hidden=args.proj_hidden,
+        ).to(DEVICE)
+        log(f"  phase 2 encoder: LipschitzReducedAutoencoderEncoder  sn_ceiling={args.sn_ceiling}"
+            + (f"  proj_hidden={args.proj_hidden}" if args.proj_hidden else ""))
     else:
-        enc2 = ReducedAutoencoderEncoder(latent_dim=args.latent_dim).to(DEVICE)
-        log(f"  phase 2 encoder: ReducedAutoencoderEncoder")
+        enc2 = ReducedAutoencoderEncoder(
+            latent_dim=args.latent_dim, proj_hidden=args.proj_hidden,
+        ).to(DEVICE)
+        log(f"  phase 2 encoder: ReducedAutoencoderEncoder"
+            + (f"  proj_hidden={args.proj_hidden}" if args.proj_hidden else ""))
     dec.requires_grad_(False)
     log(f"  reduced encoder params: {sum(p.numel() for p in enc2.parameters()):,}")
 
@@ -290,7 +296,7 @@ def main():
             x_full_b = x_full_b.to(DEVICE)
             x_red_b  = x_red_b.to(DEVICE)
             tgt      = x_full_b[:, :N_CONT_T].view(len(x_full_b), N_CONT, T_STEPS)
-            pred     = dec(enc2(x_red_b))
+            pred     = dec(enc2(x_red_b)).view(len(x_full_b), N_CONT, T_STEPS)
             loss, _, _ = ae_loss(pred, tgt)
             opt2.zero_grad(); loss.backward(); opt2.step()
             train_loss += loss.item() * len(x_full_b); n_train += len(x_full_b)
@@ -302,7 +308,8 @@ def main():
                 x_full_b = x_full_b.to(DEVICE)
                 x_red_b  = x_red_b.to(DEVICE)
                 tgt      = x_full_b[:, :N_CONT_T].view(len(x_full_b), N_CONT, T_STEPS)
-                _, mse_v, smooth_v = ae_loss(dec(enc2(x_red_b)), tgt)
+                pred_v   = dec(enc2(x_red_b)).view(len(x_full_b), N_CONT, T_STEPS)
+                _, mse_v, smooth_v = ae_loss(pred_v, tgt)
                 val_mse_sum    += mse_v.item()    * len(x_full_b)
                 val_smooth_sum += smooth_v.item() * len(x_full_b)
                 n_val          += len(x_full_b)
@@ -340,12 +347,14 @@ def main():
         device=DEVICE,
         data=dict(n_sims=n_sims, data_dir=str(data_dir)),
         model=dict(
-            phase1_encoder="LipschitzContAutoencoderEncoder" if args.lipschitz else "ContAutoencoderEncoder",
+            phase1_encoder="AutoencoderEncoder",
             phase2_encoder="LipschitzReducedAutoencoderEncoder" if args.lipschitz else "ReducedAutoencoderEncoder",
-            decoder="MultiHeadWaveformDecoder",
+            decoder="WaveformDecoder",
             latent_dim=args.latent_dim,
+            proj_hidden=args.proj_hidden,
             decoder_hidden=args.hidden,
             decoder_n_layers=args.n_layers,
+            decoder_out_channels=N_CONT,
             lipschitz=args.lipschitz,
             sn_ceiling=args.sn_ceiling if args.lipschitz else None,
         ),

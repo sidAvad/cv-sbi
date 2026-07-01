@@ -158,6 +158,9 @@ def main():
                         help="Latent dimension of the AE encoder (must match the checkpoint, default: 128)")
     parser.add_argument("--sn-ceiling", type=float, default=2.0,
                         help="Soft spectral-norm ceiling for ae-reduced-lipschitz (default: 2.0)")
+    parser.add_argument("--proj-hidden", type=int, default=None,
+                        help="Hidden dim for two-stage projection in AE encoder "
+                             "(e.g. 128 for latent_dim=64). Must match the checkpoint.")
     parser.add_argument("--flow-model", choices=["maf", "nsf"], default="maf",
                         help="Normalising flow architecture (default: maf)")
     parser.add_argument("--num-transforms", type=int, default=None,
@@ -213,9 +216,14 @@ def main():
         if not ckpt.exists():
             raise FileNotFoundError(f"{ckpt} not found.")
         if use_ae_reduced_lipschitz:
-            enc = LipschitzReducedAutoencoderEncoder(latent_dim=args.latent_dim, sn_ceiling=args.sn_ceiling)
+            enc = LipschitzReducedAutoencoderEncoder(
+                latent_dim=args.latent_dim, sn_ceiling=args.sn_ceiling,
+                proj_hidden=args.proj_hidden,
+            )
         else:
-            enc = ReducedAutoencoderEncoder(latent_dim=args.latent_dim)
+            enc = ReducedAutoencoderEncoder(
+                latent_dim=args.latent_dim, proj_hidden=args.proj_hidden,
+            )
         enc.load_state_dict(torch.load(ckpt, map_location="cpu"))
         embedding_net  = enc
         embedding_info = enc.describe()
