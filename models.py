@@ -240,7 +240,7 @@ class ReducedAutoencoderEncoder(nn.Module):
         w = self.attn_pool(h).softmax(dim=1)
         h = (w * h).sum(dim=1)
         h = self.proj(h)
-        if self.proj2 is not None:
+        if getattr(self, 'proj2', None) is not None:
             h = F.silu(h)
             h = self.proj2(h)
         return h
@@ -375,7 +375,7 @@ class LipschitzReducedAutoencoderEncoder(nn.Module):
         w = self.attn_pool(h).softmax(dim=1)
         h = (w * h).sum(dim=1)
         h = self.proj(h)
-        if self.proj2 is not None:
+        if getattr(self, 'proj2', None) is not None:
             h = F.silu(h)
             h = self.proj2(h)
         return h
